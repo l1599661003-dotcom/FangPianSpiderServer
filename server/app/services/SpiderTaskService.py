@@ -59,6 +59,7 @@ class SpiderTaskService(MySQLBaseDAO):
             SELECT t.*, 
                 (SELECT COUNT(*) FROM fp_spider_client_task WHERE task_id = t.id) as client_count 
             FROM fp_spider_task t
+            WHERE t.control_action IS NULL
             ORDER BY t.create_time DESC
             """
             return await self.fetch_all(query)
@@ -81,7 +82,7 @@ class SpiderTaskService(MySQLBaseDAO):
             SELECT t.*, 
                 (SELECT COUNT(*) FROM fp_spider_client_task WHERE task_id = t.id) as client_count 
             FROM fp_spider_task t
-            WHERE t.task_type = :task_type
+            WHERE t.task_type = :task_type AND t.control_action IS NULL
             ORDER BY t.create_time DESC
             """
             return await self.fetch_all(query, { "task_type": task_type})
@@ -104,7 +105,7 @@ class SpiderTaskService(MySQLBaseDAO):
                 SELECT t.*, 
                     (SELECT COUNT(*) FROM fp_spider_client_task WHERE task_id = t.id) as client_count 
                 FROM fp_spider_task t
-                WHERE t.status = :status and start_time <= :start_time
+                WHERE t.status = :status AND t.control_action IS NULL AND start_time <= :start_time
                 ORDER BY t.create_time DESC
             """
             return await self.fetch_all(query, { "status": status, "start_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S') })
@@ -276,4 +277,4 @@ class SpiderTaskService(MySQLBaseDAO):
             raise
 
 # 创建全局服务实例
-spider_task_service = SpiderTaskService() 
+spider_task_service = SpiderTaskService()

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -8,7 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from server.app.api.v1 import login, websocket, task_api, pgy_blogger_api, creator_bill_api, spider_token_controller, \
-    sync_spider_data_api
+    sync_spider_data_api, plugin_remote_control
+from server.app.core.PluginWebSocketManager import PluginWebSocketManager
+from server.app.services.PluginRemoteControlService import PluginRemoteControlService
 from server.app.core.config import settings
 from server.app.db.context import DatabaseManager
 from server.app.core.WebSocketManager import WebSocketManager
@@ -21,6 +24,8 @@ load_dotenv()
 # 创建全局单例对象
 ws_manager = WebSocketManager()
 task_scheduler = TaskScheduler(ws_manager)
+plugin_ws_manager = PluginWebSocketManager()
+plugin_remote_service = PluginRemoteControlService(plugin_ws_manager)
 
 # 全局变量
 sync_scheduler = None
@@ -33,6 +38,8 @@ async def lifespan(app: FastAPI):
     try:
         # 初始化数据库连接池
         await DatabaseManager.initialize()
+        await plugin_remote_service.reset_online_state()
+        asyncio.create_task(plugin_remote_service.recover_stale_executions())
         logger.info("数据库连接池初始化成功")
         
         # 配置WebSocket超时时间
@@ -70,6 +77,11 @@ async def lifespan(app: FastAPI):
         scheduler_service.stop()
         logger.info("定时任务调度器已停止")
         
+        plugin_client_ids = list(plugin_ws_manager.active_connections.keys())
+        await plugin_ws_manager.shutdown()
+        for client_id in plugin_client_ids:
+            await plugin_remote_service.set_online(client_id, False)
+
         # 关闭数据库连接池
         await DatabaseManager.close()
         logger.info("数据库连接池已关闭")
@@ -105,6 +117,7 @@ app.include_router(pgy_blogger_api.router, prefix="/api/v1", tags=["博主采集
 app.include_router(creator_bill_api.router, prefix="/api/v1", tags=["创作者账单报告"])
 app.include_router(spider_token_controller.router, prefix="/api/v1", tags=["爬虫token"])
 app.include_router(sync_spider_data_api.router, prefix="/api/v1", tags=["同步爬虫数据"])
+app.include_router(plugin_remote_control.router, prefix="/api/v1", tags=["插件远程控制"])
 
 @app.on_event("startup")
 async def startup_event():
