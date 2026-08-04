@@ -27,6 +27,8 @@ class PluginCommandRequest(BaseModel):
     params: Dict[str, Any] = Field(default_factory=dict)
     operator_id: int = 0
     title: str = Field(default="", max_length=128)
+    trigger_source: str = Field(default="manual", max_length=32)
+    trigger_rule_id: Optional[int] = None
 
     @field_validator("action")
     @classmethod

@@ -12,6 +12,7 @@ from server.app.api.v1 import login, websocket, task_api, pgy_blogger_api, creat
     sync_spider_data_api, plugin_remote_control
 from server.app.core.PluginWebSocketManager import PluginWebSocketManager
 from server.app.services.PluginRemoteControlService import PluginRemoteControlService
+from server.app.services.PluginTriggerScheduler import PluginTriggerScheduler
 from server.app.core.config import settings
 from server.app.db.context import DatabaseManager
 from server.app.core.WebSocketManager import WebSocketManager
@@ -26,6 +27,7 @@ ws_manager = WebSocketManager()
 task_scheduler = TaskScheduler(ws_manager)
 plugin_ws_manager = PluginWebSocketManager()
 plugin_remote_service = PluginRemoteControlService(plugin_ws_manager)
+plugin_trigger_scheduler = PluginTriggerScheduler(plugin_remote_service)
 
 # 全局变量
 sync_scheduler = None
@@ -40,6 +42,7 @@ async def lifespan(app: FastAPI):
         await DatabaseManager.initialize()
         await plugin_remote_service.reset_online_state()
         asyncio.create_task(plugin_remote_service.recover_stale_executions())
+        await plugin_trigger_scheduler.start()
         logger.info("数据库连接池初始化成功")
         
         # 配置WebSocket超时时间
@@ -72,6 +75,7 @@ async def lifespan(app: FastAPI):
         # 停止任务调度器
         await task_scheduler.stop()
         logger.info("任务调度器已停止")
+        await plugin_trigger_scheduler.stop()
         
         # 停止定时任务调度器
         scheduler_service.stop()

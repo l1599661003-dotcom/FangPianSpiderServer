@@ -192,6 +192,8 @@ class PluginRemoteControlService:
             "control_action": action,
             "control_params": self._json(params),
             "stop_requested": 0,
+            "trigger_source": request.get("trigger_source", "manual"),
+            "trigger_rule_id": request.get("trigger_rule_id"),
         })
 
         executions = []
