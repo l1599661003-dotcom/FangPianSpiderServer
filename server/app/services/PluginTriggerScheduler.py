@@ -168,8 +168,28 @@ class PluginTriggerScheduler:
                 "trigger_rule_id": rule_id,
             })
             batch_id = int(result.get("batch_id") or 0)
-            message = f"Triggered batch #{batch_id} for {len(target_clients)} browser instances"
-            await self._write_log(rule_id, batch_id, source, "triggered", message, len(target_clients))
+            executions = result.get("executions") or []
+            sent_count = sum(1 for item in executions if item.get("sent"))
+            failed_messages = [
+                str(item.get("message") or "")
+                for item in executions
+                if not item.get("sent") and str(item.get("message") or "")
+            ]
+            if sent_count <= 0:
+                message = (
+                    f"Created batch #{batch_id}, but no browser instance received the command"
+                )
+                if failed_messages:
+                    message += ": " + "; ".join(sorted(set(failed_messages)))[:420]
+                await self._write_log(rule_id, batch_id, source, "failed", message, 0)
+                await self._mark_rule(rule_id, now, message)
+                return
+            message = (
+                f"Triggered batch #{batch_id}: sent to {sent_count}/{len(target_clients)} browser instances"
+            )
+            if failed_messages:
+                message += "; failed: " + "; ".join(sorted(set(failed_messages)))[:360]
+            await self._write_log(rule_id, batch_id, source, "triggered", message, sent_count)
             await self._mark_rule(rule_id, now, message)
         except Exception as exc:
             message = str(exc)[:512]
