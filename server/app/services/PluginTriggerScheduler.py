@@ -153,7 +153,8 @@ class PluginTriggerScheduler:
         if not target_clients:
             message = self._no_target_message(resolve_stats)
             await self._write_log(rule_id, None, source, "skipped", message, 0)
-            await self._mark_rule(rule_id, now, message)
+            if not self._should_retry_on_another_worker(resolve_stats):
+                await self._mark_rule(rule_id, now, message)
             return
 
         params = self._decode_json(rule.get("params_json"))
@@ -285,6 +286,21 @@ class PluginTriggerScheduler:
         return (
             "No online idle browser instances matched the rule: "
             f"db_matched={db_count}, connected={connected_count}, target_type={target_type}, target_ids={target_ids}."
+        )
+
+    @staticmethod
+    def _should_retry_on_another_worker(stats: Dict[str, Any]) -> bool:
+        """Do not consume the rule interval when another worker may own the socket.
+
+        WebSocket connections are process-local. In a multi-worker deployment,
+        a worker without the browser socket can still see `is_online = 1` in DB.
+        If it updates `last_trigger_time`, the worker that actually owns the
+        WebSocket will skip the rule until the next interval. Leaving
+        `last_trigger_time` unchanged lets another worker dispatch it.
+        """
+        return (
+            int(stats.get("db_matched_count") or 0) > 0
+            and int(stats.get("connected_count") or 0) == 0
         )
 
     async def _filter_condition_clients(

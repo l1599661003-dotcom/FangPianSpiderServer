@@ -1,20 +1,10 @@
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 
-PLUGIN_ACTIONS = {
-    "pgy.cookie_upload",
-    "pgy.catalog_fetch",
-    "pgy.catalog_update",
-    "pgy.catalog_retry_failed",
-    "pgy.catalog_update_signed",
-    "pgy_cookie_upload",
-    "catalog_fetch",
-    "catalog_update",
-    "catalog_retry_failed",
-    "catalog_update_signed",
-}
+PLUGIN_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]*(?:[._][a-z][a-z0-9_]*)*$")
 
 
 class PluginRegisterRequest(BaseModel):
@@ -38,9 +28,10 @@ class PluginCommandRequest(BaseModel):
     @field_validator("action")
     @classmethod
     def validate_action(cls, value: str) -> str:
-        if value not in PLUGIN_ACTIONS:
-            raise ValueError(f"unsupported plugin action: {value}")
-        return value
+        action = value.strip()
+        if len(action) > 96 or not PLUGIN_ACTION_RE.fullmatch(action):
+            raise ValueError(f"invalid plugin action: {value}")
+        return action
 
     @field_validator("client_ids")
     @classmethod

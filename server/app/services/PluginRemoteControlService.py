@@ -20,6 +20,7 @@ ACTION_TASK_TYPES = {
     "catalog_retry_failed": 93,
     "catalog_update_signed": 94,
 }
+GENERIC_ACTION_TASK_TYPE = 99
 
 ACTION_ALIASES = {
     "pgy.cookie_upload": "pgy_cookie_upload",
@@ -188,11 +189,16 @@ class PluginRemoteControlService:
 
     async def _upsert_platform_account(self, client_id: int, data: Dict[str, Any], now: datetime):
         platform = str(data.get("platform") or "pgy")[:32]
-        if platform != "pgy" and not data.get("cookie_uploaded"):
-            return
-        platform_name = {"pgy": "蒲公英", "xingtu": "星图", "channels": "视频号"}.get(platform, platform)
         account_name = str(data.get("pgy_account") or data.get("account_name") or "")[:128]
         company_name = str(data.get("pgy_company_name") or data.get("company_name") or "")[:128]
+        if platform != "pgy" and not data.get("cookie_uploaded") and not account_name and not company_name:
+            return
+        platform_name = {
+            "douyin": "抖音",
+            "pgy": "蒲公英",
+            "xingtu": "星图/抖音",
+            "channels": "视频号",
+        }.get(platform, platform)
         cookie_uploaded_at = now if data.get("cookie_uploaded") else None
         context_json = self._json(data)
         try:
@@ -229,8 +235,6 @@ class PluginRemoteControlService:
 
     async def create_batch(self, request: Dict[str, Any]) -> Dict[str, Any]:
         action = self.normalize_action(str(request["action"]))
-        if action not in ACTION_TASK_TYPES:
-            raise ValueError(f"unsupported plugin action: {request['action']}")
         params = request.get("params") or {}
         client_ids = request["client_ids"]
         now = datetime.now()
@@ -238,7 +242,7 @@ class PluginRemoteControlService:
             "spider_task_title": request.get("title") or action,
             "platform_id": 0,
             "period_type": 3,
-            "task_type": ACTION_TASK_TYPES[action],
+            "task_type": ACTION_TASK_TYPES.get(action, GENERIC_ACTION_TASK_TYPE),
             "status": 1,
             "start_time": now,
             "end_time": now,
