@@ -21,6 +21,14 @@ ACTION_TASK_TYPES = {
     "catalog_update_signed": 94,
 }
 
+ACTION_ALIASES = {
+    "pgy.cookie_upload": "pgy_cookie_upload",
+    "pgy.catalog_fetch": "catalog_fetch",
+    "pgy.catalog_update": "catalog_update",
+    "pgy.catalog_retry_failed": "catalog_retry_failed",
+    "pgy.catalog_update_signed": "catalog_update_signed",
+}
+
 FINAL_EXECUTION_STATUSES = {"success", "partial_failed", "failed", "stopped", "timeout"}
 
 
@@ -34,6 +42,7 @@ class PluginRemoteControlService:
         self.client_task_dao = MySQLBaseDAO("fp_spider_client_task")
         self.task_log_dao = MySQLBaseDAO("fp_spider_client_task_log")
         self.blogger_dao = MySQLBaseDAO("fp_spider_blogger")
+        self.client_account_dao = MySQLBaseDAO("fp_plugin_client_account")
 
     @staticmethod
     def _hash_token(token: str) -> str:
@@ -42,6 +51,10 @@ class PluginRemoteControlService:
     @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def normalize_action(action: str) -> str:
+        return ACTION_ALIASES.get(action, action)
 
     async def register(self, data: Dict[str, Any], ip_address: str) -> Dict[str, Any]:
         device_id = data["device_id"]
@@ -162,17 +175,62 @@ class PluginRemoteControlService:
             await self.refresh_task_status(task_id)
 
     async def update_account_context(self, client_id: int, data: Dict[str, Any]):
-        update = {"last_heartbeat": datetime.now(), "update_time": datetime.now()}
+        now = datetime.now()
+        update = {"last_heartbeat": now, "update_time": now}
         if "pgy_company_name" in data:
             update["pgy_company_name"] = str(data.get("pgy_company_name") or "")[:128]
         if "pgy_account" in data:
             update["pgy_account"] = str(data.get("pgy_account") or "")[:128]
         if data.get("cookie_uploaded"):
-            update["cookie_uploaded_at"] = datetime.now()
+            update["cookie_uploaded_at"] = now
         await self.client_dao.update(update, {"id": client_id})
+        await self._upsert_platform_account(client_id, data, now)
+
+    async def _upsert_platform_account(self, client_id: int, data: Dict[str, Any], now: datetime):
+        platform = str(data.get("platform") or "pgy")[:32]
+        if platform != "pgy" and not data.get("cookie_uploaded"):
+            return
+        platform_name = {"pgy": "蒲公英", "xingtu": "星图", "channels": "视频号"}.get(platform, platform)
+        account_name = str(data.get("pgy_account") or data.get("account_name") or "")[:128]
+        company_name = str(data.get("pgy_company_name") or data.get("company_name") or "")[:128]
+        cookie_uploaded_at = now if data.get("cookie_uploaded") else None
+        context_json = self._json(data)
+        try:
+            existing = await self.client_account_dao.fetch_one(
+                """
+                SELECT id, cookie_uploaded_at
+                FROM fp_plugin_client_account
+                WHERE client_id = :client_id AND platform = :platform
+                LIMIT 1
+                """,
+                {"client_id": client_id, "platform": platform},
+            )
+            row = {
+                "platform_name": platform_name,
+                "account_name": account_name,
+                "company_name": company_name,
+                "context_json": context_json,
+                "update_time": now,
+            }
+            if cookie_uploaded_at:
+                row["cookie_uploaded_at"] = cookie_uploaded_at
+            if existing:
+                await self.client_account_dao.update(row, {"id": existing["id"]})
+            else:
+                await self.client_account_dao.insert({
+                    **row,
+                    "client_id": client_id,
+                    "platform": platform,
+                    "cookie_uploaded_at": cookie_uploaded_at,
+                    "create_time": now,
+                })
+        except Exception as exc:
+            logger.warning(f"同步插件平台账号上下文失败: client={client_id}, platform={platform}, error={exc}")
 
     async def create_batch(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        action = request["action"]
+        action = self.normalize_action(str(request["action"]))
+        if action not in ACTION_TASK_TYPES:
+            raise ValueError(f"unsupported plugin action: {request['action']}")
         params = request.get("params") or {}
         client_ids = request["client_ids"]
         now = datetime.now()

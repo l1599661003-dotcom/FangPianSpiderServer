@@ -4,6 +4,11 @@ from pydantic import BaseModel, Field, field_validator
 
 
 PLUGIN_ACTIONS = {
+    "pgy.cookie_upload",
+    "pgy.catalog_fetch",
+    "pgy.catalog_update",
+    "pgy.catalog_retry_failed",
+    "pgy.catalog_update_signed",
     "pgy_cookie_upload",
     "catalog_fetch",
     "catalog_update",
