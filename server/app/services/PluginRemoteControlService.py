@@ -3,8 +3,10 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -19,6 +21,10 @@ ACTION_TASK_TYPES = {
     "catalog_update": 92,
     "catalog_retry_failed": 93,
     "catalog_update_signed": 94,
+    "xingtu_catalog_fetch": 101,
+    "xingtu_catalog_update": 102,
+    "xingtu_catalog_retry_failed": 103,
+    "xingtu_catalog_update_signed": 104,
 }
 GENERIC_ACTION_TASK_TYPE = 99
 
@@ -28,9 +34,14 @@ ACTION_ALIASES = {
     "pgy.catalog_update": "catalog_update",
     "pgy.catalog_retry_failed": "catalog_retry_failed",
     "pgy.catalog_update_signed": "catalog_update_signed",
+    "xingtu.catalog_fetch": "xingtu_catalog_fetch",
+    "xingtu.catalog_update": "xingtu_catalog_update",
+    "xingtu.catalog_retry_failed": "xingtu_catalog_retry_failed",
+    "xingtu.catalog_update_signed": "xingtu_catalog_update_signed",
 }
 
 FINAL_EXECUTION_STATUSES = {"success", "partial_failed", "failed", "stopped", "timeout"}
+DEFAULT_UPGRADE_CONFIG_PATH = Path(os.getenv("PLUGIN_UPGRADE_CONFIG_PATH", "data/plugin_upgrade.json"))
 
 
 class PluginRemoteControlService:
@@ -44,6 +55,7 @@ class PluginRemoteControlService:
         self.task_log_dao = MySQLBaseDAO("fp_spider_client_task_log")
         self.blogger_dao = MySQLBaseDAO("fp_spider_blogger")
         self.client_account_dao = MySQLBaseDAO("fp_plugin_client_account")
+        self.employee_dao = MySQLBaseDAO("fp_employee")
 
     @staticmethod
     def _hash_token(token: str) -> str:
@@ -54,8 +66,109 @@ class PluginRemoteControlService:
         return json.dumps(value, ensure_ascii=False, default=str)
 
     @staticmethod
+    def _version_tuple(version: str) -> tuple:
+        parts = re.findall(r"\d+", str(version or ""))
+        return tuple(int(part) for part in parts[:6])
+
+    @classmethod
+    def _version_lt(cls, current: str, latest: str) -> bool:
+        current_tuple = cls._version_tuple(current)
+        latest_tuple = cls._version_tuple(latest)
+        if not latest_tuple:
+            return False
+        size = max(len(current_tuple), len(latest_tuple))
+        return current_tuple + (0,) * (size - len(current_tuple)) < latest_tuple + (0,) * (size - len(latest_tuple))
+
+    @staticmethod
     def normalize_action(action: str) -> str:
         return ACTION_ALIASES.get(action, action)
+
+    @staticmethod
+    def _positive_int(value: Any) -> int:
+        try:
+            number = int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+        return number if number > 0 else 0
+
+    async def _resolve_tianji_employee_id(self, data: Dict[str, Any]) -> int:
+        """Resolve the extension-reported Tianji login into fp_employee.id.
+
+        fp_spider_client.admin_id is historically named, but the model relation
+        points to fp_employee.id. The Tianji login payload usually exposes the
+        admin account id, so we must translate it before binding.
+        """
+        employee_id = self._positive_int(data.get("tianji_employee_id"))
+        if employee_id:
+            employee = await self.employee_dao.fetch_one(
+                """
+                SELECT id
+                FROM fp_employee
+                WHERE id = :employee_id
+                  AND (delete_time IS NULL OR delete_time = 0)
+                LIMIT 1
+                """,
+                {"employee_id": employee_id},
+            )
+            if employee:
+                return int(employee["id"])
+
+        admin_id = self._positive_int(data.get("tianji_admin_id"))
+        if not admin_id:
+            return 0
+
+        employee = await self.employee_dao.fetch_one(
+            """
+            SELECT id
+            FROM fp_employee
+            WHERE admin_id = :admin_id
+              AND (delete_time IS NULL OR delete_time = 0)
+            ORDER BY status DESC, id DESC
+            LIMIT 1
+            """,
+            {"admin_id": admin_id},
+        )
+        return int(employee["id"]) if employee else 0
+
+    async def _find_reinstall_claim_candidate(
+        self, data: Dict[str, Any], ip_address: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find one safe old browser instance to reuse after extension reinstall.
+
+        A reinstall loses extension local storage, so the browser generates a
+        new device_id and has no token. To avoid duplicate rows, we only auto
+        claim when there is exactly one recently-seen, currently-offline plugin
+        instance with the same public IP and browser type.
+        """
+        browser_type = str(data.get("browser_type") or "Unknown")
+        rows = await self.client_dao.fetch_all(
+            """
+            SELECT *
+            FROM fp_spider_client
+            WHERE client_token_hash IS NOT NULL
+              AND client_token_hash <> ''
+              AND browser_type = :browser_type
+              AND ip_address = :ip_address
+              AND is_online = 0
+              AND (last_heartbeat IS NULL OR last_heartbeat >= DATE_SUB(NOW(), INTERVAL 30 DAY))
+            ORDER BY
+              CASE WHEN status = 1 AND admin_id IS NOT NULL AND admin_id <> 0
+                     AND computer_id IS NOT NULL AND computer_id <> 0
+                   THEN 0 ELSE 1 END,
+              last_heartbeat DESC,
+              id DESC
+            LIMIT 2
+            """,
+            {"browser_type": browser_type, "ip_address": ip_address},
+        )
+        if len(rows) == 1:
+            return rows[0]
+        if len(rows) > 1:
+            logger.info(
+                f"Plugin reinstall auto-claim skipped: multiple candidates, "
+                f"ip={ip_address}, browser={browser_type}, ids={[row.get('id') for row in rows]}"
+            )
+        return None
 
     async def register(self, data: Dict[str, Any], ip_address: str) -> Dict[str, Any]:
         device_id = data["device_id"]
@@ -69,25 +182,55 @@ class PluginRemoteControlService:
             stored_hash = existing.get("client_token_hash") or ""
             if not raw_token or not hmac.compare_digest(stored_hash, self._hash_token(raw_token)):
                 raise PermissionError("browser instance token is invalid")
-            await self.client_dao.update({
+            update = {
                 "browser_type": data.get("browser_type", "Unknown"),
                 "browser_version": data.get("browser_version", ""),
                 "extension_version": data.get("extension_version", ""),
                 "ip_address": ip_address,
                 "last_heartbeat": now,
                 "update_time": now,
-            }, {"id": existing["id"]})
+            }
+            employee_id = await self._resolve_tianji_employee_id(data)
+            if employee_id:
+                update["admin_id"] = employee_id
+            await self.client_dao.update(update, {"id": existing["id"]})
             return self._registration_response(await self.get_client(existing["id"]), raw_token, False)
 
         raw_token = secrets.token_urlsafe(32)
         browser_type = data.get("browser_type", "Unknown")
+        employee_id = await self._resolve_tianji_employee_id(data)
+
+        if not (data.get("client_token") or ""):
+            candidate = await self._find_reinstall_claim_candidate(data, ip_address)
+            if candidate:
+                old_device_id = candidate.get("device_id") or ""
+                await self.client_dao.update({
+                    "client_name": candidate.get("client_name") or f"{browser_type}-{device_id[-6:].upper()}",
+                    "plugin_instance_name": candidate.get("plugin_instance_name") or f"{browser_type}-{device_id[-6:].upper()}",
+                    "device_id": device_id,
+                    "ip_address": ip_address,
+                    "is_online": 0,
+                    "browser_type": browser_type,
+                    "browser_version": data.get("browser_version", ""),
+                    "extension_version": data.get("extension_version", ""),
+                    "client_token_hash": self._hash_token(raw_token),
+                    "last_heartbeat": now,
+                    "update_time": now,
+                    **({"admin_id": employee_id} if employee_id else {}),
+                }, {"id": candidate["id"]})
+                logger.info(
+                    f"Plugin reinstall auto-claimed old instance: "
+                    f"client={candidate['id']}, old_device={old_device_id}, new_device={device_id}, ip={ip_address}"
+                )
+                return self._registration_response(await self.get_client(candidate["id"]), raw_token, False)
+
         instance_name = f"{browser_type}-{device_id[-6:].upper()}"
         client_id = await self.client_dao.insert({
             "client_name": instance_name,
             "plugin_instance_name": instance_name,
             "device_id": device_id,
             "ip_address": ip_address,
-            "admin_id": 0,
+            "admin_id": employee_id or 0,
             "status": 0,
             "is_online": 0,
             "computer_id": None,
@@ -110,6 +253,80 @@ class PluginRemoteControlService:
             "client_token": token,
             "enabled": enabled,
             "client_name": client.get("plugin_instance_name") or client.get("client_name"),
+        }
+
+    def load_upgrade_config(self) -> Dict[str, Any]:
+        path = DEFAULT_UPGRADE_CONFIG_PATH
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        defaults = {
+            "enabled": False,
+            "latest_version": "",
+            "title": "天选插件发现新版本",
+            "changelog": [],
+            "package_url": "",
+            "package_name": "",
+            "target_folder_name": "tianxuan-0.0.1",
+            "changed_files": [],
+            "force": False,
+        }
+        try:
+            if not path.exists():
+                return defaults
+            with path.open("r", encoding="utf-8") as file:
+                config = json.load(file)
+            if not isinstance(config, dict):
+                return defaults
+            return {**defaults, **config}
+        except Exception as exc:
+            logger.warning(f"读取插件升级配置失败: path={path}, error={exc}")
+            return defaults
+
+    def build_upgrade_notice(self, client: Dict[str, Any], force: bool = False) -> Optional[Dict[str, Any]]:
+        config = self.load_upgrade_config()
+        latest_version = str(config.get("latest_version") or "").strip()
+        package_url = str(config.get("package_url") or "").strip()
+        current_version = str(client.get("extension_version") or "").strip()
+        if not config.get("enabled") or not latest_version or not package_url:
+            return None
+        if not (force or config.get("force") or self._version_lt(current_version, latest_version)):
+            return None
+        return {
+            "latest_version": latest_version,
+            "current_version": current_version,
+            "title": str(config.get("title") or "天选插件发现新版本"),
+            "changelog": config.get("changelog") if isinstance(config.get("changelog"), list) else [],
+            "package_url": package_url,
+            "package_name": str(config.get("package_name") or f"tianxuan-{latest_version}.zip"),
+            "target_folder_name": str(config.get("target_folder_name") or "tianxuan-0.0.1"),
+            "changed_files": config.get("changed_files") if isinstance(config.get("changed_files"), list) else [],
+            "force": bool(force or config.get("force")),
+        }
+
+    async def send_upgrade_notice(self, client_id: int, force: bool = False) -> Dict[str, Any]:
+        client = await self.get_client(client_id)
+        if not client:
+            return {"client_id": client_id, "sent": False, "message": "browser instance not found"}
+        notice = self.build_upgrade_notice(client, force=force)
+        if not notice:
+            return {"client_id": client_id, "sent": False, "message": "no upgrade notice matched"}
+        if not self.manager.is_connected(client_id):
+            return {"client_id": client_id, "sent": False, "message": "browser instance is offline"}
+        sent = await self.manager.send(client_id, {
+            "cmd": "plugin_upgrade_notice",
+            "data": notice,
+            "timestamp": datetime.now().timestamp(),
+        })
+        return {"client_id": client_id, "sent": sent, "message": "sent" if sent else "send failed"}
+
+    async def notify_upgrade(self, client_ids: List[int], force: bool = False) -> Dict[str, Any]:
+        results = []
+        for client_id in client_ids:
+            results.append(await self.send_upgrade_notice(int(client_id), force=force))
+        return {
+            "total": len(results),
+            "sent": sum(1 for item in results if item.get("sent")),
+            "results": results,
         }
 
     async def authenticate(self, device_id: str, token: str) -> Optional[Dict[str, Any]]:
@@ -178,6 +395,9 @@ class PluginRemoteControlService:
     async def update_account_context(self, client_id: int, data: Dict[str, Any]):
         now = datetime.now()
         update = {"last_heartbeat": now, "update_time": now}
+        employee_id = await self._resolve_tianji_employee_id(data)
+        if employee_id:
+            update["admin_id"] = employee_id
         if "pgy_company_name" in data:
             update["pgy_company_name"] = str(data.get("pgy_company_name") or "")[:128]
         if "pgy_account" in data:
@@ -191,8 +411,8 @@ class PluginRemoteControlService:
         platform = str(data.get("platform") or "pgy")[:32]
         account_name = str(data.get("pgy_account") or data.get("account_name") or "")[:128]
         company_name = str(data.get("pgy_company_name") or data.get("company_name") or "")[:128]
-        if platform != "pgy" and not data.get("cookie_uploaded") and not account_name and not company_name:
-            return
+        if platform != "pgy" and not account_name and not company_name:
+            account_name = "已连接"
         platform_name = {
             "douyin": "抖音",
             "pgy": "蒲公英",
@@ -388,6 +608,19 @@ class PluginRemoteControlService:
                 status_name = "failed"
             status = 2 if status_name == "success" else (4 if status_name == "stopped" else 3)
             message = str(data.get("error") or data.get("message") or status_name)
+            if isinstance(data.get("failed_items"), list):
+                for item in data.get("failed_items")[:1000]:
+                    if isinstance(item, dict):
+                        try:
+                            await self._save_blogger_result(execution["task_id"], client_id, {
+                                "item_key": item.get("platform_user_id") or item.get("star_id") or item.get("creator_id"),
+                                "item_name": item.get("creator_nickname") or item.get("nickname") or item.get("name"),
+                                "success": False,
+                                "error": item.get("reason") or message,
+                                "payload": item,
+                            })
+                        except Exception as exc:
+                            logger.warning(f"保存插件失败项明细失败: task={execution['task_id']}, client={client_id}, error={exc}")
             await self._finish_execution(
                 execution_id, status, message,
                 int(data.get("total", 0) or 0),
@@ -552,6 +785,11 @@ class PluginRemoteControlService:
         await self.refresh_task_status(batch_id)
 
     async def retry_failed(self, batch_id: int, client_ids: Optional[List[int]], operator_id: int) -> Dict[str, Any]:
+        task = await self.task_dao.fetch_one(
+            "SELECT control_action FROM fp_spider_task WHERE id = :id LIMIT 1",
+            {"id": batch_id},
+        )
+        retry_action = "xingtu_catalog_retry_failed" if str(task.get("control_action") if task else "").startswith("xingtu_") else "catalog_retry_failed"
         executions = await self.client_task_dao.fetch_all(
             "SELECT * FROM fp_spider_client_task WHERE task_id = :task_id AND status IN (3,4)",
             {"task_id": batch_id},
@@ -573,7 +811,7 @@ class PluginRemoteControlService:
             ]
             retry_clients.append(execution["client_id"])
         return await self.create_batch({
-            "action": "catalog_retry_failed",
+            "action": retry_action,
             "client_ids": retry_clients,
             "params": {"source_task_id": batch_id, "items_by_client": items_by_client},
             "operator_id": operator_id,

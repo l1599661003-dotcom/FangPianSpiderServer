@@ -9,6 +9,7 @@ from server.app.schemas.PluginRemoteControl import (
     PluginEvent,
     PluginRegisterRequest,
     PluginRetryRequest,
+    PluginUpgradeNotifyRequest,
 )
 
 
@@ -16,7 +17,7 @@ router = APIRouter(prefix="/plugin")
 
 
 def get_plugin_service():
-    from server.app.main import plugin_remote_service
+    from server.app.runtime import plugin_remote_service
     return plugin_remote_service
 
 
@@ -53,6 +54,12 @@ async def plugin_websocket(websocket: WebSocket):
             "cmd": "registration_status",
             "data": {"client_id": client_id, "enabled": enabled},
         })
+        upgrade_notice = service.build_upgrade_notice(client)
+        if upgrade_notice:
+            await service.manager.send(client_id, {
+                "cmd": "plugin_upgrade_notice",
+                "data": upgrade_notice,
+            })
         while True:
             raw = await websocket.receive_text()
             event = PluginEvent.model_validate_json(raw)
@@ -94,3 +101,9 @@ async def retry_command(batch_id: int, payload: PluginRetryRequest, x_plugin_con
         return {"ok": True, **result}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/upgrade/notify", summary="推送插件升级提醒")
+async def notify_upgrade(payload: PluginUpgradeNotifyRequest, x_plugin_control_key: str = Header(default="")):
+    require_control_key(x_plugin_control_key)
+    return {"ok": True, **await get_plugin_service().notify_upgrade(payload.client_ids, payload.force)}

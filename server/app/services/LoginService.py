@@ -124,7 +124,7 @@ class UserService(MySQLBaseDAO):
             )
 
     def get_websocket_manager(self):
-        from server.app.main import ws_manager
+        from server.app.runtime import ws_manager
         return ws_manager
 
 # 创建全局服务实例

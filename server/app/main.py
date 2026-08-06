@@ -10,25 +10,21 @@ from loguru import logger
 
 from server.app.api.v1 import login, websocket, task_api, pgy_blogger_api, creator_bill_api, spider_token_controller, \
     sync_spider_data_api, plugin_remote_control
-from server.app.core.PluginWebSocketManager import PluginWebSocketManager
-from server.app.services.PluginRemoteControlService import PluginRemoteControlService
-from server.app.services.PluginTriggerScheduler import PluginTriggerScheduler
 from server.app.core.config import settings
 from server.app.db.context import DatabaseManager
-from server.app.core.WebSocketManager import WebSocketManager
-from server.app.core.TaskScheduler import TaskScheduler
+from server.app.runtime import (
+    plugin_remote_service,
+    plugin_trigger_scheduler,
+    plugin_ws_manager,
+    task_scheduler,
+    ws_manager,
+)
 from server.app.services.SchedulerService import scheduler_service
 from server.app.services.sync.sync_task import SyncScheduler
 
 load_dotenv()
 
 # 创建全局单例对象
-ws_manager = WebSocketManager()
-task_scheduler = TaskScheduler(ws_manager)
-plugin_ws_manager = PluginWebSocketManager()
-plugin_remote_service = PluginRemoteControlService(plugin_ws_manager)
-plugin_trigger_scheduler = PluginTriggerScheduler(plugin_remote_service)
-
 # 全局变量
 sync_scheduler = None
 

@@ -367,6 +367,7 @@ TABLE_MAPPING: Dict[str, Dict[str, Any]] = {
     "douyin_kol_marketing_stats": {
         "mysql_table": "fp_douyin_kol_marketing_stats",
         "primary_key": "platform_user_id",
+        "business_keys": ["platform_user_id", "douyin_business"],
         "sync_key": "sync_status",
         "batch_size": 1,
         "is_update": False,

@@ -223,6 +223,46 @@ class MySQLBaseDAO:
             # logger.error(f"批量删除记录失败: {str(e)}, 表: {self.table_name}, 字段: {key_field}, 值数量: {len(values)}")
             raise
 
+    async def batch_delete_by_composite_keys(self, key_fields: List[str], rows: List[Dict[str, Any]]) -> int:
+        """
+        根据联合业务键批量删除记录
+
+        Args:
+            key_fields: 联合业务键字段名列表
+            rows: 包含联合业务键的数据列表
+
+        Returns:
+            删除的记录数
+        """
+        if not key_fields or not rows:
+            return 0
+
+        valid_rows = [
+            row for row in rows
+            if all(field in row and row[field] is not None for field in key_fields)
+        ]
+        if not valid_rows:
+            return 0
+
+        try:
+            or_clauses = []
+            params: Dict[str, Any] = {}
+
+            for row_index, row in enumerate(valid_rows):
+                and_clauses = []
+                for field in key_fields:
+                    param_name = f"{field}_{row_index}"
+                    and_clauses.append(f"{field} = :{param_name}")
+                    params[param_name] = row[field]
+                or_clauses.append("(" + " AND ".join(and_clauses) + ")")
+
+            sql = f"DELETE FROM {self.table_name} WHERE " + " OR ".join(or_clauses)
+            result = await self.execute(sql, params)
+            return result.rowcount
+        except Exception as e:
+            logger.error(f"联合键批量删除失败: {str(e)}, 表: {self.table_name}, 字段: {key_fields}")
+            raise
+
 
 class MongoDBBaseDAO:
     """MongoDB数据访问基类"""

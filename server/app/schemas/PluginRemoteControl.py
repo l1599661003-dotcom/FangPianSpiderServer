@@ -14,6 +14,9 @@ class PluginRegisterRequest(BaseModel):
     browser_version: str = Field(default="", max_length=32)
     extension_version: str = Field(default="", max_length=32)
     user_agent: str = Field(default="", max_length=512)
+    tianji_employee_id: Optional[int] = None
+    tianji_admin_id: Optional[int] = None
+    tianji_username: str = Field(default="", max_length=64)
 
 
 class PluginCommandRequest(BaseModel):
@@ -42,6 +45,16 @@ class PluginCommandRequest(BaseModel):
 class PluginRetryRequest(BaseModel):
     client_ids: Optional[List[int]] = None
     operator_id: int = 0
+
+
+class PluginUpgradeNotifyRequest(BaseModel):
+    client_ids: List[int] = Field(min_length=1)
+    force: bool = False
+
+    @field_validator("client_ids")
+    @classmethod
+    def unique_client_ids(cls, value: List[int]) -> List[int]:
+        return list(dict.fromkeys(value))
 
 
 class PluginEvent(BaseModel):

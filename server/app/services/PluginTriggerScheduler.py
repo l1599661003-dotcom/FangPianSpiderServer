@@ -63,18 +63,24 @@ class PluginTriggerScheduler:
         now = datetime.now()
         for rule in rules:
             rule_id = int(rule["id"])
-            if rule_id in self._running_rules:
-                continue
-            due, source, reason = self._is_due(rule, now)
-            if not due:
-                if reason:
-                    await self._update_next_time(rule, now)
-                continue
-            self._running_rules.add(rule_id)
             try:
-                await self._trigger_rule(rule, source, now)
-            finally:
-                self._running_rules.discard(rule_id)
+                if rule_id in self._running_rules:
+                    continue
+                due, source, reason = self._is_due(rule, now)
+                if not due:
+                    if reason:
+                        await self._update_next_time(rule, now)
+                    continue
+                self._running_rules.add(rule_id)
+                try:
+                    await self._trigger_rule(rule, source, now)
+                finally:
+                    self._running_rules.discard(rule_id)
+            except Exception as exc:
+                message = str(exc)[:512]
+                logger.exception(f"Plugin trigger rule {rule_id} check failed: {message}")
+                await self._write_log(rule_id, None, "scheduler", "failed", message, 0)
+                continue
 
     def _is_due(self, rule: Dict[str, Any], now: datetime) -> tuple[bool, str, str]:
         trigger_type = str(rule.get("trigger_type") or "")
@@ -201,11 +207,11 @@ class PluginTriggerScheduler:
     async def _resolve_clients(self, rule: Dict[str, Any]) -> tuple[List[int], Dict[str, Any]]:
         target_type = str(rule.get("target_type") or "client")
         target_ids = [int(item) for item in self._decode_json(rule.get("target_ids_json")) if int(item or 0)]
+        target_clause = ""
         where = [
             "c.browser_type IS NOT NULL",
             "c.browser_type <> ''",
             "c.status = 1",
-            "c.is_online = 1",
             "c.admin_id IS NOT NULL",
             "c.admin_id <> 0",
             "c.computer_id IS NOT NULL",
@@ -242,20 +248,71 @@ class PluginTriggerScheduler:
                 key = f"target_{index}"
                 placeholders.append(f":{key}")
                 params[key] = value
-            where.append(f"{field} IN ({', '.join(placeholders)})")
+            target_clause = f"{field} IN ({', '.join(placeholders)})"
+            where.append(target_clause)
 
         rows = await self.client_dao.fetch_all(
             f"SELECT c.id FROM fp_spider_client c WHERE {' AND '.join(where)} ORDER BY c.id ASC",
             params,
         )
         stats["db_matched_count"] = len(rows)
+        stats["db_matched_client_ids"] = [int(row["id"]) for row in rows]
+        if not rows:
+            stats.update(await self._resolve_client_diagnostics(target_clause, params))
         client_ids = []
+        active_connection_ids = set(self.plugin_service.manager.active_connections.keys())
+        stats["active_connection_ids"] = sorted(active_connection_ids)
         for row in rows:
             client_id = int(row["id"])
             if self.plugin_service.manager.is_connected(client_id):
                 client_ids.append(client_id)
         stats["connected_count"] = len(client_ids)
         return client_ids, stats
+
+    async def _resolve_client_diagnostics(
+        self, target_clause: str, params: Dict[str, Any]
+    ) -> Dict[str, int]:
+        """Count how many target instances survive each scheduler filter."""
+        base = ["c.browser_type IS NOT NULL", "c.browser_type <> ''"]
+        if target_clause:
+            base.append(target_clause)
+
+        filters = {
+            "target_total_count": [],
+            "enabled_count": ["c.status = 1"],
+            "online_count": ["c.status = 1", "c.is_online = 1"],
+            "bound_count": [
+                "c.status = 1",
+                "c.admin_id IS NOT NULL",
+                "c.admin_id <> 0",
+                "c.computer_id IS NOT NULL",
+                "c.computer_id <> 0",
+            ],
+            "idle_count": [
+                "c.status = 1",
+                "c.admin_id IS NOT NULL",
+                "c.admin_id <> 0",
+                "c.computer_id IS NOT NULL",
+                "c.computer_id <> 0",
+                """
+                NOT EXISTS (
+                    SELECT 1 FROM fp_spider_client_task e
+                    INNER JOIN fp_spider_task t ON t.id = e.task_id
+                    WHERE e.client_id = c.id
+                      AND e.status = 1
+                      AND t.control_action IS NOT NULL
+                )
+                """,
+            ],
+        }
+        result: Dict[str, int] = {}
+        for key, extra in filters.items():
+            row = await self.client_dao.fetch_one(
+                f"SELECT COUNT(*) AS total FROM fp_spider_client c WHERE {' AND '.join(base + extra)}",
+                params,
+            )
+            result[key] = int((row or {}).get("total") or 0)
+        return result
 
     @staticmethod
     def _no_target_message(stats: Dict[str, Any]) -> str:
@@ -267,16 +324,27 @@ class PluginTriggerScheduler:
         connected_count = int(stats.get("connected_count") or 0)
         condition_count = stats.get("condition_matched_count")
         if db_count == 0:
+            diagnostics = (
+                f" diagnostics: target_total={int(stats.get('target_total_count') or 0)}, "
+                f"enabled={int(stats.get('enabled_count') or 0)}, "
+                f"db_online={int(stats.get('online_count') or 0)}, "
+                f"bound={int(stats.get('bound_count') or 0)}, "
+                f"idle={int(stats.get('idle_count') or 0)}."
+            )
             return (
                 "No online idle browser instances matched the rule: "
                 f"target_type={target_type}, target_ids={target_ids}. "
                 "Check that the instance is enabled, online, bound to an employee and a computer group, and not already running a task."
+                + diagnostics
             )
         if connected_count == 0:
+            db_client_ids = stats.get("db_matched_client_ids") or []
+            active_ids = stats.get("active_connection_ids") or []
             return (
                 "Database matched online idle instances, but none has an active WebSocket connection to this Python service: "
                 f"db_matched={db_count}, target_type={target_type}, target_ids={target_ids}. "
-                "Check that the extension WebSocket URL points to this service and the browser is still connected."
+                f"db_client_ids={db_client_ids[:20]}, active_ws_client_ids={active_ids[:20]}. "
+                "Check that the extension WebSocket URL points to this service, the browser is still connected, and the Python runtime singletons are not duplicated."
             )
         if condition_count == 0:
             return (
@@ -412,6 +480,10 @@ class PluginTriggerScheduler:
     @staticmethod
     def _parse_time(value: str) -> time:
         hour, minute = [int(part) for part in str(value).split(":")[:2]]
+        if hour == 24 and minute == 0:
+            return time(23, 59, 59)
+        hour = max(0, min(23, hour))
+        minute = max(0, min(59, minute))
         return time(hour=hour, minute=minute)
 
     @staticmethod

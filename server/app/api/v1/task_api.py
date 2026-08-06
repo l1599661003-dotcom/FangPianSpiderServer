@@ -11,7 +11,7 @@ router = APIRouter()
 
 # 依赖注入函数
 async def get_task_scheduler():
-    from server.app.main import task_scheduler
+    from server.app.runtime import task_scheduler
     return task_scheduler
 
 

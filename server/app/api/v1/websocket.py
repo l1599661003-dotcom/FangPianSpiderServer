@@ -21,11 +21,11 @@ command_generator = CommandGenerator()
 
 # 依赖注入函数
 def get_websocket_manager():
-    from server.app.main import ws_manager
+    from server.app.runtime import ws_manager
     return ws_manager
 
 def get_task_scheduler():
-    from server.app.main import task_scheduler
+    from server.app.runtime import task_scheduler
     return task_scheduler
 
 

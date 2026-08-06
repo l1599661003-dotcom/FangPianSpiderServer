@@ -69,16 +69,13 @@ class MongoToMySQLSyncService:
                             # 执行更新操作
                             await self._update_mysql_data(mysql_dao, transformed_data, table_config)
                         else:
-                            # 通过主键删除历史数据
-                            primary_key = table_config['primary_key']
-                            mysql_primary_key = table_config['fields'][primary_key]
-                            
-                            # 构建业务键值列表
-                            key_values = [doc[mysql_primary_key] for doc in transformed_data if mysql_primary_key in doc]
-                            
-                            if key_values:
-                                # 批量删除历史数据
-                                deleted_count = await mysql_dao.batch_delete_by_keys(mysql_primary_key, key_values)
+                            deleted_count, has_business_keys = await self._delete_existing_records(
+                                mysql_dao,
+                                transformed_data,
+                                table_config,
+                            )
+
+                            if has_business_keys:
                                 logger.info(f"批量删除历史数据成功，表: {table_config['mysql_table']}, 删除记录数: {deleted_count}")
                             else:
                                 logger.warning(f"没有找到有效的业务键值，表: {table_config['mysql_table']}")
@@ -140,16 +137,13 @@ class MongoToMySQLSyncService:
                         # 执行更新操作
                         await self._update_mysql_data(mysql_dao, transformed_data, table_config)
                     else:
-                        # 通过主键删除历史数据
-                        primary_key = table_config['primary_key']
-                        mysql_primary_key = table_config['fields'][primary_key]
-                        
-                        # 构建业务键值列表
-                        key_values = [doc[mysql_primary_key] for doc in transformed_data if mysql_primary_key in doc]
-                        
-                        if key_values:
-                            # 批量删除历史数据
-                            deleted_count = await mysql_dao.batch_delete_by_keys(mysql_primary_key, key_values)
+                        deleted_count, has_business_keys = await self._delete_existing_records(
+                            mysql_dao,
+                            transformed_data,
+                            table_config,
+                        )
+
+                        if has_business_keys:
                             logger.info(f"批量删除历史数据成功，表: {table_config['mysql_table']}, 删除记录数: {deleted_count}")
                         else:
                             logger.warning(f"没有找到有效的业务键值，表: {table_config['mysql_table']}")
@@ -170,6 +164,44 @@ class MongoToMySQLSyncService:
             logger.exception(f"同步表 {collection_name} 失败")
             logger.error(f"同步表 {collection_name} 失败: {str(e)}")
             raise
+
+    def _get_business_key_fields(self, table_config: Dict[str, Any]) -> List[str]:
+        business_keys = table_config.get('business_keys')
+        if business_keys:
+            if isinstance(business_keys, str):
+                business_keys = [business_keys]
+            return [table_config['fields'][key] for key in business_keys]
+
+        primary_key = table_config['primary_key']
+        return [table_config['fields'][primary_key]]
+
+    async def _delete_existing_records(
+        self,
+        mysql_dao: MySQLBaseDAO,
+        transformed_data: List[Dict[str, Any]],
+        table_config: Dict[str, Any],
+    ):
+        key_fields = self._get_business_key_fields(table_config)
+        logger.info(f"表 {table_config['mysql_table']} 使用业务键删除: {key_fields}")
+
+        if len(key_fields) == 1:
+            key_field = key_fields[0]
+            key_values = [doc[key_field] for doc in transformed_data if doc.get(key_field) is not None]
+            if not key_values:
+                return 0, False
+            deleted_count = await mysql_dao.batch_delete_by_keys(key_field, key_values)
+            return deleted_count, True
+
+        key_rows = [
+            {field: doc[field] for field in key_fields}
+            for doc in transformed_data
+            if all(doc.get(field) is not None for field in key_fields)
+        ]
+        if not key_rows:
+            return 0, False
+
+        deleted_count = await mysql_dao.batch_delete_by_composite_keys(key_fields, key_rows)
+        return deleted_count, True
 
     async def _update_mysql_data(self, mysql_dao: MySQLBaseDAO, data: List[Dict[str, Any]], table_config: Dict[str, Any]):
         """
