@@ -45,11 +45,14 @@ async def plugin_websocket(websocket: WebSocket):
     if not client:
         await websocket.close(code=4401, reason="invalid browser instance credentials")
         return
+    if not service._is_enabled_client(client):
+        await websocket.close(code=4403, reason="plugin instance is not enabled")
+        return
     client_id = int(client["id"])
     try:
         await service.manager.connect(websocket, client_id)
         await service.set_online(client_id, True)
-        enabled = bool(client.get("status") == 1 and client.get("admin_id") and client.get("computer_id"))
+        enabled = service._is_enabled_client(client)
         await service.manager.send(client_id, {
             "cmd": "registration_status",
             "data": {"client_id": client_id, "enabled": enabled},
@@ -106,4 +109,8 @@ async def retry_command(batch_id: int, payload: PluginRetryRequest, x_plugin_con
 @router.post("/upgrade/notify", summary="推送插件升级提醒")
 async def notify_upgrade(payload: PluginUpgradeNotifyRequest, x_plugin_control_key: str = Header(default="")):
     require_control_key(x_plugin_control_key)
-    return {"ok": True, **await get_plugin_service().notify_upgrade(payload.client_ids, payload.force)}
+    try:
+        result = await get_plugin_service().notify_upgrade(payload.client_ids, payload.force)
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

@@ -1,25 +1,24 @@
-{
-  "enabled": false,
-  "latest_version": "0.0.39",
-  "title": "天选插件 0.0.39 更新",
-  "changelog": [
-    "新增插件半自动升级提醒",
-    "支持后台向在线浏览器推送升级说明",
-    "用户覆盖原 tianxuan-0.0.1 文件夹后可一键刷新插件",
-    "修复客户端中心按星图/抖音筛选为空的问题",
-    "修复星图新签约博主获取卡在加载中的问题，增加分页、超时和错误提示"
-  ],
-  "package_url": "https://tianji.fangpian999.com/plugin/tianxuan/tianxuan-0.0.39.zip",
-  "package_name": "tianxuan-0.0.39.zip",
-  "target_folder_name": "tianxuan-0.0.1",
-  "changed_files": [
-    "plugin-remote-control.js",
-    "upgrade.html",
-    "upgrade.css",
-    "upgrade.js",
-    "xingtu-background.js",
-    "content-scripts/xingtu-content.js",
-    "manifest.json"
-  ],
-  "force": false
+﻿{
+    "enabled":  true,
+    "latest_version":  "0.0.45",
+    "title":  "天选插件 0.0.45 更新",
+    "changelog":  [
+                      "收到后台升级通知后自动下载、校验并安装更新",
+                      "升级完成后显示一次新版本通知",
+                      "浏览器不支持通知时自动打开升级完成页",
+                      "自动更新失败时在后台重试，不再打开手动下载页面"
+                  ],
+    "package_url":  "https://tianji.fangpian999.com/public/chrom-plugin/tianxuan.zip",
+    "package_name":  "tianxuan.zip",
+    "package_sha256":  "a3942df045ae517ae7f3401a0c074ebec3185fa694ee11d8fbe07f7ce0a643ab",
+    "target_folder_name":  "tianxuan",
+    "silent_update":  true,
+    "changed_files":  [
+                          "manifest.json",
+                          "plugin-remote-control.js",
+                          "upgrade-success.html",
+                          "upgrade-success.css",
+                          "upgrade-success.js"
+                      ],
+    "force":  false
 }

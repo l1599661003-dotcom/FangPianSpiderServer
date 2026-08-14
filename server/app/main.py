@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
         await plugin_remote_service.reset_online_state()
         asyncio.create_task(plugin_remote_service.recover_stale_executions())
         await plugin_trigger_scheduler.start()
+        scheduler_service.start()
         logger.info("数据库连接池初始化成功")
         
         # 配置WebSocket超时时间
@@ -54,14 +55,12 @@ async def lifespan(app: FastAPI):
         # await task_scheduler.start()
         logger.info("任务调度器启动成功")
         
-        # 启动定时任务调度器（包含创作者账单报告任务）
-        # scheduler_service.start()
         logger.info("定时任务调度器启动成功")
 
         # 初始化数据同步调度器
         global sync_scheduler
         sync_scheduler = SyncScheduler()
-        # await sync_scheduler.start()
+        await sync_scheduler.start()
     except Exception as e:
         logger.error(f"应用启动失败: {e}")
         raise
@@ -103,10 +102,10 @@ app = FastAPI(
 # 配置CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.get_cors_origins(),
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
+    allow_methods=settings.get_cors_allow_methods(),
+    allow_headers=settings.get_cors_allow_headers(),
 )
 
 # 注册路由
@@ -118,25 +117,6 @@ app.include_router(creator_bill_api.router, prefix="/api/v1", tags=["创作者�
 app.include_router(spider_token_controller.router, prefix="/api/v1", tags=["爬虫token"])
 app.include_router(sync_spider_data_api.router, prefix="/api/v1", tags=["同步爬虫数据"])
 app.include_router(plugin_remote_control.router, prefix="/api/v1", tags=["插件远程控制"])
-
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时的初始化"""
-    # ... 其他初始化代码 ...
-
-    # 初始化数据同步调度器
-    global sync_scheduler
-    sync_scheduler = SyncScheduler()
-    await sync_scheduler.start()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """应用关闭时的清理"""
-    # ... 其他清理代码 ...
-
-    # 关闭数据同步调度器
-    if sync_scheduler:
-        await sync_scheduler.shutdown()
 
 if __name__ == "__main__":
     logger.add("data/logs/server_{time}.log", rotation="1 day", retention="7 days", level="INFO")

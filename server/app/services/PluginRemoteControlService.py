@@ -1,14 +1,18 @@
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
 import secrets
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse
 
+import httpx
 from loguru import logger
 
 from server.app.core.PluginWebSocketManager import PluginWebSocketManager
@@ -41,7 +45,23 @@ ACTION_ALIASES = {
 }
 
 FINAL_EXECUTION_STATUSES = {"success", "partial_failed", "failed", "stopped", "timeout"}
-DEFAULT_UPGRADE_CONFIG_PATH = Path(os.getenv("PLUGIN_UPGRADE_CONFIG_PATH", "data/plugin_upgrade.json"))
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_UPGRADE_CONFIG_PATH = PROJECT_ROOT / "data" / "plugin_upgrade.json"
+DEFAULT_UPGRADE_CONFIG = {
+    "enabled": False,
+    "latest_version": "",
+    "title": "天选插件发现新版本",
+    "changelog": [],
+    "package_url": "",
+    "package_name": "",
+    "package_sha256": "",
+    "target_folder_name": "tianxuan",
+    "silent_update": False,
+    "changed_files": [],
+    "force": False,
+}
+UPGRADE_NOTIFY_CONCURRENCY = 20
+MAX_UPGRADE_PACKAGE_BYTES = 200 * 1024 * 1024
 
 
 class PluginRemoteControlService:
@@ -62,6 +82,56 @@ class PluginRemoteControlService:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     @staticmethod
+    def _normalize_sha256(value: Any) -> str:
+        text = re.sub(r"\s+", "", str(value or "")).lower()
+        return text if re.fullmatch(r"[0-9a-f]{64}", text) else ""
+
+    @staticmethod
+    def _as_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _string_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [text for item in value if (text := str(item or "").strip())]
+
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        try:
+            parsed = urlparse(value)
+            if parsed.scheme == "https" and parsed.netloc:
+                return True
+            return parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _versioned_package_url(package_url: str, package_sha256: str) -> str:
+        if not package_sha256:
+            return package_url
+        parsed = urlparse(package_url)
+        query = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "tianxuan_sha256"
+        ]
+        query.append(("tianxuan_sha256", package_sha256))
+        return parsed._replace(query=urlencode(query)).geturl()
+
+    @staticmethod
+    def _upgrade_config_path() -> Path:
+        configured = str(os.getenv("PLUGIN_UPGRADE_CONFIG_PATH") or "").strip()
+        if not configured:
+            return DEFAULT_UPGRADE_CONFIG_PATH
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else PROJECT_ROOT / path
+
+    @staticmethod
     def _json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -69,6 +139,13 @@ class PluginRemoteControlService:
     def _version_tuple(version: str) -> tuple:
         parts = re.findall(r"\d+", str(version or ""))
         return tuple(int(part) for part in parts[:6])
+
+    @staticmethod
+    def _is_valid_extension_version(version: str) -> bool:
+        text = str(version or "").strip()
+        if not re.fullmatch(r"\d+(?:\.\d+){0,3}", text):
+            return False
+        return all(0 <= int(part) <= 65535 for part in text.split("."))
 
     @classmethod
     def _version_lt(cls, current: str, latest: str) -> bool:
@@ -90,6 +167,15 @@ class PluginRemoteControlService:
         except (TypeError, ValueError):
             return 0
         return number if number > 0 else 0
+
+    @staticmethod
+    def _is_enabled_client(client: Optional[Dict[str, Any]]) -> bool:
+        return bool(
+            client
+            and client.get("status") == 1
+            and PluginRemoteControlService._positive_int(client.get("admin_id"))
+            and PluginRemoteControlService._positive_int(client.get("computer_id"))
+        )
 
     async def _resolve_tianji_employee_id(self, data: Dict[str, Any]) -> int:
         """Resolve the extension-reported Tianji login into fp_employee.id.
@@ -193,6 +279,8 @@ class PluginRemoteControlService:
             employee_id = await self._resolve_tianji_employee_id(data)
             if employee_id:
                 update["admin_id"] = employee_id
+            elif not self._positive_int(existing.get("admin_id")):
+                update["admin_id"] = None
             await self.client_dao.update(update, {"id": existing["id"]})
             return self._registration_response(await self.get_client(existing["id"]), raw_token, False)
 
@@ -204,7 +292,7 @@ class PluginRemoteControlService:
             candidate = await self._find_reinstall_claim_candidate(data, ip_address)
             if candidate:
                 old_device_id = candidate.get("device_id") or ""
-                await self.client_dao.update({
+                update = {
                     "client_name": candidate.get("client_name") or f"{browser_type}-{device_id[-6:].upper()}",
                     "plugin_instance_name": candidate.get("plugin_instance_name") or f"{browser_type}-{device_id[-6:].upper()}",
                     "device_id": device_id,
@@ -216,8 +304,12 @@ class PluginRemoteControlService:
                     "client_token_hash": self._hash_token(raw_token),
                     "last_heartbeat": now,
                     "update_time": now,
-                    **({"admin_id": employee_id} if employee_id else {}),
-                }, {"id": candidate["id"]})
+                }
+                if employee_id:
+                    update["admin_id"] = employee_id
+                elif not self._positive_int(candidate.get("admin_id")):
+                    update["admin_id"] = None
+                await self.client_dao.update(update, {"id": candidate["id"]})
                 logger.info(
                     f"Plugin reinstall auto-claimed old instance: "
                     f"client={candidate['id']}, old_device={old_device_id}, new_device={device_id}, ip={ip_address}"
@@ -230,7 +322,7 @@ class PluginRemoteControlService:
             "plugin_instance_name": instance_name,
             "device_id": device_id,
             "ip_address": ip_address,
-            "admin_id": employee_id or 0,
+            "admin_id": employee_id or None,
             "status": 0,
             "is_online": 0,
             "computer_id": None,
@@ -245,69 +337,188 @@ class PluginRemoteControlService:
         return self._registration_response(await self.get_client(client_id), raw_token, True)
 
     def _registration_response(self, client: Dict[str, Any], token: str, created: bool) -> Dict[str, Any]:
-        enabled = bool(client.get("status") == 1 and client.get("admin_id") and client.get("computer_id"))
         return {
             "ok": True,
             "created": created,
             "client_id": client["id"],
             "client_token": token,
-            "enabled": enabled,
+            "enabled": self._is_enabled_client(client),
             "client_name": client.get("plugin_instance_name") or client.get("client_name"),
         }
 
     def load_upgrade_config(self) -> Dict[str, Any]:
-        path = DEFAULT_UPGRADE_CONFIG_PATH
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        defaults = {
-            "enabled": False,
-            "latest_version": "",
-            "title": "天选插件发现新版本",
-            "changelog": [],
-            "package_url": "",
-            "package_name": "",
-            "target_folder_name": "tianxuan-0.0.1",
-            "changed_files": [],
-            "force": False,
-        }
+        path = self._upgrade_config_path()
         try:
             if not path.exists():
-                return defaults
-            with path.open("r", encoding="utf-8") as file:
+                logger.warning(f"插件升级配置不存在，升级通知已关闭: path={path}")
+                return dict(DEFAULT_UPGRADE_CONFIG)
+            with path.open("r", encoding="utf-8-sig") as file:
                 config = json.load(file)
             if not isinstance(config, dict):
-                return defaults
-            return {**defaults, **config}
+                raise ValueError("upgrade config root must be an object")
+
+            merged = {**DEFAULT_UPGRADE_CONFIG, **config}
+            merged.update({
+                "enabled": self._as_bool(merged.get("enabled")),
+                "latest_version": str(merged.get("latest_version") or "").strip(),
+                "title": str(merged.get("title") or DEFAULT_UPGRADE_CONFIG["title"]).strip(),
+                "changelog": self._string_list(merged.get("changelog")),
+                "package_url": str(merged.get("package_url") or "").strip(),
+                "package_name": str(merged.get("package_name") or "").strip(),
+                "package_sha256": self._normalize_sha256(merged.get("package_sha256")),
+                "target_folder_name": str(merged.get("target_folder_name") or "tianxuan").strip(),
+                "silent_update": self._as_bool(merged.get("silent_update")),
+                "changed_files": self._string_list(merged.get("changed_files")),
+                "force": self._as_bool(merged.get("force")),
+            })
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", merged["target_folder_name"]):
+                logger.warning(
+                    f"插件升级目录名非法，已使用默认值: value={merged['target_folder_name']!r}"
+                )
+                merged["target_folder_name"] = "tianxuan"
+            return merged
         except Exception as exc:
             logger.warning(f"读取插件升级配置失败: path={path}, error={exc}")
-            return defaults
+            return dict(DEFAULT_UPGRADE_CONFIG)
 
-    def build_upgrade_notice(self, client: Dict[str, Any], force: bool = False) -> Optional[Dict[str, Any]]:
-        config = self.load_upgrade_config()
+    @classmethod
+    def _read_package_version(cls, package: bytes) -> str:
+        try:
+            with zipfile.ZipFile(io.BytesIO(package)) as archive:
+                manifest_names = [
+                    name
+                    for name in archive.namelist()
+                    if name == "manifest.json"
+                    or re.fullmatch(r"[^/]+/manifest\.json", name)
+                ]
+                if len(manifest_names) != 1:
+                    raise ValueError("升级包必须包含唯一的 manifest.json")
+                manifest = json.loads(archive.read(manifest_names[0]).decode("utf-8-sig"))
+        except (zipfile.BadZipFile, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"升级包不是有效的天选插件 ZIP: {exc}") from exc
+        version = str(manifest.get("version") or "").strip() if isinstance(manifest, dict) else ""
+        if not cls._is_valid_extension_version(version):
+            raise ValueError(f"升级包 manifest.json 版本无效: {version!r}")
+        return version
+
+    def _save_upgrade_config(self, config: Dict[str, Any]) -> None:
+        path = self._upgrade_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    async def refresh_upgrade_package_metadata(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        package_url = str(config.get("package_url") or "").strip()
+        if not self._is_http_url(package_url):
+            raise ValueError(f"插件升级包 URL 无效: {package_url!r}")
+        parsed_package_url = urlparse(package_url)
+        package_query = parse_qsl(parsed_package_url.query, keep_blank_values=True)
+        package_query.append(("tianxuan_refresh", str(int(datetime.now().timestamp() * 1000))))
+        refresh_url = parsed_package_url._replace(query=urlencode(package_query)).geturl()
+
+        digest = hashlib.sha256()
+        package_chunks = []
+        package_size = 0
+        timeout = httpx.Timeout(120.0, connect=15.0)
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+                async with client.stream(
+                    "GET",
+                    refresh_url,
+                    headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        package_size += len(chunk)
+                        if package_size > MAX_UPGRADE_PACKAGE_BYTES:
+                            raise ValueError("插件升级包超过 200 MB，已停止推送")
+                        digest.update(chunk)
+                        package_chunks.append(chunk)
+        except httpx.HTTPError as exc:
+            raise ValueError(f"下载线上插件升级包失败: {exc}") from exc
+
+        if package_size == 0:
+            raise ValueError("插件升级包为空")
+        package = b"".join(package_chunks)
+        package_version = self._read_package_version(package)
+        package_sha256 = digest.hexdigest()
+        refreshed = {
+            **config,
+            "latest_version": package_version,
+            "package_sha256": package_sha256,
+            "silent_update": True,
+        }
+        self._save_upgrade_config(refreshed)
+        logger.info(
+            f"插件升级包校验完成: version={package_version}, sha256={package_sha256}, size={package_size}"
+        )
+        return refreshed
+
+    def build_upgrade_notice(
+        self,
+        client: Dict[str, Any],
+        force: bool = False,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        config = config if config is not None else self.load_upgrade_config()
         latest_version = str(config.get("latest_version") or "").strip()
         package_url = str(config.get("package_url") or "").strip()
+        package_sha256 = self._normalize_sha256(config.get("package_sha256"))
+        versioned_package_url = self._versioned_package_url(package_url, package_sha256)
         current_version = str(client.get("extension_version") or "").strip()
-        if not config.get("enabled") or not latest_version or not package_url:
+        if not self._as_bool(config.get("enabled")) or not self._is_valid_extension_version(latest_version):
             return None
-        if not (force or config.get("force") or self._version_lt(current_version, latest_version)):
+        if not self._is_http_url(package_url):
+            logger.warning(f"插件升级包 URL 无效，已跳过通知: url={package_url!r}")
             return None
+        current_tuple = self._version_tuple(current_version)
+        latest_tuple = self._version_tuple(latest_version)
+        size = max(len(current_tuple), len(latest_tuple))
+        padded_current = current_tuple + (0,) * (size - len(current_tuple))
+        padded_latest = latest_tuple + (0,) * (size - len(latest_tuple))
+        if current_tuple and padded_current > padded_latest:
+            logger.warning(
+                f"拒绝向较新插件下发旧版本: current={current_version}, latest={latest_version}"
+            )
+            return None
+        configured_force = self._as_bool(config.get("force"))
+        if not (force or configured_force or self._version_lt(current_version, latest_version)):
+            return None
+        silent_update = self._as_bool(config.get("silent_update")) and bool(package_sha256)
+        if self._as_bool(config.get("silent_update")) and not package_sha256:
+            logger.warning("插件升级包缺少有效 SHA-256，已降级为手动更新")
         return {
             "latest_version": latest_version,
             "current_version": current_version,
             "title": str(config.get("title") or "天选插件发现新版本"),
             "changelog": config.get("changelog") if isinstance(config.get("changelog"), list) else [],
-            "package_url": package_url,
+            "package_url": versioned_package_url,
             "package_name": str(config.get("package_name") or f"tianxuan-{latest_version}.zip"),
-            "target_folder_name": str(config.get("target_folder_name") or "tianxuan-0.0.1"),
+            "package_sha256": package_sha256,
+            "target_folder_name": str(config.get("target_folder_name") or "tianxuan"),
+            "silent_update": silent_update,
             "changed_files": config.get("changed_files") if isinstance(config.get("changed_files"), list) else [],
-            "force": bool(force or config.get("force")),
+            "force": bool(force or configured_force),
         }
 
-    async def send_upgrade_notice(self, client_id: int, force: bool = False) -> Dict[str, Any]:
+    async def send_upgrade_notice(
+        self,
+        client_id: int,
+        force: bool = False,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         client = await self.get_client(client_id)
         if not client:
             return {"client_id": client_id, "sent": False, "message": "browser instance not found"}
-        notice = self.build_upgrade_notice(client, force=force)
+        notice = self.build_upgrade_notice(client, force=force, config=config)
         if not notice:
             return {"client_id": client_id, "sent": False, "message": "no upgrade notice matched"}
         if not self.manager.is_connected(client_id):
@@ -320,9 +531,22 @@ class PluginRemoteControlService:
         return {"client_id": client_id, "sent": sent, "message": "sent" if sent else "send failed"}
 
     async def notify_upgrade(self, client_ids: List[int], force: bool = False) -> Dict[str, Any]:
-        results = []
-        for client_id in client_ids:
-            results.append(await self.send_upgrade_notice(int(client_id), force=force))
+        semaphore = asyncio.Semaphore(UPGRADE_NOTIFY_CONCURRENCY)
+        config = await self.refresh_upgrade_package_metadata(self.load_upgrade_config())
+
+        async def send(client_id: int) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    return await self.send_upgrade_notice(int(client_id), force=force, config=config)
+                except Exception as exc:
+                    logger.exception(f"推送插件升级通知失败: client={client_id}, error={exc}")
+                    return {
+                        "client_id": int(client_id),
+                        "sent": False,
+                        "message": "internal send error",
+                    }
+
+        results = await asyncio.gather(*(send(client_id) for client_id in client_ids))
         return {
             "total": len(results),
             "sent": sum(1 for item in results if item.get("sent")),

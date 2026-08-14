@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any
+from typing import Any, Dict, List
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -17,7 +17,23 @@ class Settings(BaseSettings):
     # 应用配置
     APP_NAME: str = "FangPian Spider Server"
     APP_VERSION: str = "1.0.0"
-    DEBUG: bool = True
+    DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
+
+    # Web CORS 配置
+    CORS_ORIGINS: str = os.getenv(
+        "CORS_ORIGINS",
+        "https://tianji.fangpian999.com,"
+        "http://localhost:3000,"
+        "http://127.0.0.1:3000,"
+        "http://localhost:5173,"
+        "http://127.0.0.1:5173",
+    )
+    CORS_ALLOW_CREDENTIALS: bool = os.getenv("CORS_ALLOW_CREDENTIALS", "false").lower() == "true"
+    CORS_ALLOW_METHODS: str = os.getenv("CORS_ALLOW_METHODS", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+    CORS_ALLOW_HEADERS: str = os.getenv(
+        "CORS_ALLOW_HEADERS",
+        "Authorization,Content-Type,X-Requested-With,X-Plugin-Control-Key,X-Plugin-Device-Id,X-Plugin-Client-Token",
+    )
     
     # MySQL配置
     MYSQL_HOST: str = os.getenv("MYSQL_HOST", "127.0.0.1")
@@ -41,10 +57,45 @@ class Settings(BaseSettings):
     MONGODB_DATABASE: str = os.getenv("MONGODB_DATABASE", "fangpian")
     MONGODB_POOL_SIZE: int = int(os.getenv("MONGODB_POOL_SIZE", "5"))
 
+    @staticmethod
+    def _parse_csv(value: str, fallback: List[str]) -> List[str]:
+        items = [item.strip() for item in str(value or "").split(",") if item.strip()]
+        return items or list(fallback)
+
+    def get_cors_origins(self) -> List[str]:
+        origins = self._parse_csv(self.CORS_ORIGINS, ["https://tianji.fangpian999.com"])
+        if "*" in origins:
+            logger.warning("CORS_ORIGINS 包含通配符 *，已忽略该项以避免与 credentials 冲突")
+            origins = [origin for origin in origins if origin != "*"]
+        return origins or ["https://tianji.fangpian999.com"]
+
+    def get_cors_allow_methods(self) -> List[str]:
+        return self._parse_csv(self.CORS_ALLOW_METHODS, ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+
+    def get_cors_allow_headers(self) -> List[str]:
+        return self._parse_csv(
+            self.CORS_ALLOW_HEADERS,
+            [
+                "Authorization",
+                "Content-Type",
+                "X-Requested-With",
+                "X-Plugin-Control-Key",
+                "X-Plugin-Device-Id",
+                "X-Plugin-Client-Token",
+            ],
+        )
+
 
 # 创建全局配置实例
 settings = Settings()
-logger.info(f"数据库配置: {settings.dict()}")
+logger.info(
+    "数据库配置已加载: mysql={host}:{port}/{database}, mongodb={mongo_database}, debug={debug}",
+    host=settings.MYSQL_HOST,
+    port=settings.MYSQL_PORT,
+    database=settings.MYSQL_DATABASE,
+    mongo_database=settings.MONGODB_DATABASE,
+    debug=settings.DEBUG,
+)
 
 
 class DatabaseConfig:
