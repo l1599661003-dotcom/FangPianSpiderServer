@@ -23,12 +23,23 @@ ACTION_TASK_TYPES = {
     "pgy_cookie_upload": 90,
     "catalog_fetch": 91,
     "catalog_update": 92,
+    "catalog_update_by_uid": 97,
     "catalog_retry_failed": 93,
     "catalog_update_signed": 94,
+    "pgy_invitation_messages": 95,
+    "pgy_invitation_wechat": 96,
+    "pgy_invitation_send": 98,
+    "pgy_invitation_wechat_by_ids": 106,
+    "pgy_outreach_due_fetch": 107,
     "xingtu_catalog_fetch": 101,
     "xingtu_catalog_update": 102,
+    "xingtu_catalog_update_by_uid": 105,
     "xingtu_catalog_retry_failed": 103,
     "xingtu_catalog_update_signed": 104,
+    "viral_xhs_note_list": 108,
+    "viral_douyin_item_list": 109,
+    "pgy_creator_out_sign": 110,
+    "xingtu_creator_out_sign": 111,
 }
 GENERIC_ACTION_TASK_TYPE = 99
 
@@ -36,12 +47,23 @@ ACTION_ALIASES = {
     "pgy.cookie_upload": "pgy_cookie_upload",
     "pgy.catalog_fetch": "catalog_fetch",
     "pgy.catalog_update": "catalog_update",
+    "pgy.catalog_update_by_uid": "catalog_update_by_uid",
     "pgy.catalog_retry_failed": "catalog_retry_failed",
     "pgy.catalog_update_signed": "catalog_update_signed",
+    "pgy.invitation_messages": "pgy_invitation_messages",
+    "pgy.invitation_wechat": "pgy_invitation_wechat",
+    "pgy.invitation_send": "pgy_invitation_send",
+    "pgy.invitation_wechat_by_ids": "pgy_invitation_wechat_by_ids",
+    "pgy.outreach_due_fetch": "pgy_outreach_due_fetch",
     "xingtu.catalog_fetch": "xingtu_catalog_fetch",
     "xingtu.catalog_update": "xingtu_catalog_update",
+    "xingtu.catalog_update_by_uid": "xingtu_catalog_update_by_uid",
     "xingtu.catalog_retry_failed": "xingtu_catalog_retry_failed",
     "xingtu.catalog_update_signed": "xingtu_catalog_update_signed",
+    "viral.xhs.note_list": "viral_xhs_note_list",
+    "viral.douyin.item_list": "viral_douyin_item_list",
+    "pgy.creator_out_sign": "pgy_creator_out_sign",
+    "xingtu.creator_out_sign": "xingtu_creator_out_sign",
 }
 
 FINAL_EXECUTION_STATUSES = {"success", "partial_failed", "failed", "stopped", "timeout"}
@@ -177,6 +199,12 @@ class PluginRemoteControlService:
             and PluginRemoteControlService._positive_int(client.get("computer_id"))
         )
 
+    @staticmethod
+    def _apply_logged_in_enable(update: Dict[str, Any], employee_id: int) -> None:
+        if employee_id:
+            update["admin_id"] = employee_id
+            update["status"] = 1
+
     async def _resolve_tianji_employee_id(self, data: Dict[str, Any]) -> int:
         """Resolve the extension-reported Tianji login into fp_employee.id.
 
@@ -277,9 +305,8 @@ class PluginRemoteControlService:
                 "update_time": now,
             }
             employee_id = await self._resolve_tianji_employee_id(data)
-            if employee_id:
-                update["admin_id"] = employee_id
-            elif not self._positive_int(existing.get("admin_id")):
+            self._apply_logged_in_enable(update, employee_id)
+            if not employee_id and not self._positive_int(existing.get("admin_id")):
                 update["admin_id"] = None
             await self.client_dao.update(update, {"id": existing["id"]})
             return self._registration_response(await self.get_client(existing["id"]), raw_token, False)
@@ -305,9 +332,8 @@ class PluginRemoteControlService:
                     "last_heartbeat": now,
                     "update_time": now,
                 }
-                if employee_id:
-                    update["admin_id"] = employee_id
-                elif not self._positive_int(candidate.get("admin_id")):
+                self._apply_logged_in_enable(update, employee_id)
+                if not employee_id and not self._positive_int(candidate.get("admin_id")):
                     update["admin_id"] = None
                 await self.client_dao.update(update, {"id": candidate["id"]})
                 logger.info(
@@ -323,7 +349,7 @@ class PluginRemoteControlService:
             "device_id": device_id,
             "ip_address": ip_address,
             "admin_id": employee_id or None,
-            "status": 0,
+            "status": 1 if employee_id else 0,
             "is_online": 0,
             "computer_id": None,
             "browser_type": browser_type,
@@ -620,8 +646,7 @@ class PluginRemoteControlService:
         now = datetime.now()
         update = {"last_heartbeat": now, "update_time": now}
         employee_id = await self._resolve_tianji_employee_id(data)
-        if employee_id:
-            update["admin_id"] = employee_id
+        self._apply_logged_in_enable(update, employee_id)
         if "pgy_company_name" in data:
             update["pgy_company_name"] = str(data.get("pgy_company_name") or "")[:128]
         if "pgy_account" in data:
@@ -635,6 +660,9 @@ class PluginRemoteControlService:
         platform = str(data.get("platform") or "pgy")[:32]
         account_name = str(data.get("pgy_account") or data.get("account_name") or "")[:128]
         company_name = str(data.get("pgy_company_name") or data.get("company_name") or "")[:128]
+        platform_user_id = str(data.get("pgy_user_id") or data.get("platform_user_id") or account_name)[:64]
+        platform_red_id = str(data.get("pgy_red_id") or data.get("platform_red_id") or "")[:64]
+        platform_nickname = str(data.get("pgy_nickname") or data.get("platform_nickname") or company_name)[:128]
         if platform != "pgy" and not account_name and not company_name:
             account_name = "已连接"
         platform_name = {
@@ -659,6 +687,10 @@ class PluginRemoteControlService:
                 "platform_name": platform_name,
                 "account_name": account_name,
                 "company_name": company_name,
+                "platform_user_id": platform_user_id,
+                "platform_red_id": platform_red_id,
+                "platform_nickname": platform_nickname,
+                "last_verified_at": now if platform_user_id else None,
                 "context_json": context_json,
                 "update_time": now,
             }

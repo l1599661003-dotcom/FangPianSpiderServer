@@ -96,7 +96,23 @@ class PluginTriggerScheduler:
             return self._monthly_due(schedule, last, now)
         if trigger_type == "condition":
             return self._condition_due(condition, last, now)
+        if trigger_type == "api_only":
+            return False, "api_only", ""
+        if trigger_type == "once":
+            return self._once_due(schedule, last, now)
         return False, trigger_type, "unknown trigger type"
+
+    def _once_due(
+        self, schedule: Dict[str, Any], last: Optional[datetime], now: datetime
+    ) -> tuple[bool, str, str]:
+        run_at = self._to_datetime(schedule.get("run_at"))
+        if not run_at:
+            return False, "once", "missing run_at"
+        if now < run_at:
+            return False, "once", "waiting"
+        if last and last >= run_at:
+            return False, "once", ""
+        return True, "once", ""
 
     def _interval_window_due(
         self, schedule: Dict[str, Any], last: Optional[datetime], now: datetime
@@ -159,7 +175,12 @@ class PluginTriggerScheduler:
         if not target_clients:
             message = self._no_target_message(resolve_stats)
             await self._write_log(rule_id, None, source, "skipped", message, 0)
-            if not self._should_retry_on_another_worker(resolve_stats):
+            if str(rule.get("trigger_type")) == "once":
+                await self.rule_dao.update({
+                    "last_result": message[:256],
+                    "update_time": now,
+                }, {"id": rule_id})
+            elif not self._should_retry_on_another_worker(resolve_stats):
                 await self._mark_rule(rule_id, now, message)
             return
 
@@ -189,7 +210,14 @@ class PluginTriggerScheduler:
                 if failed_messages:
                     message += ": " + "; ".join(sorted(set(failed_messages)))[:420]
                 await self._write_log(rule_id, batch_id, source, "failed", message, 0)
-                await self._mark_rule(rule_id, now, message)
+                # 一次性抓号发出去失败时不关规则、不写 last_trigger_time，下次上线再试。
+                if str(rule.get("trigger_type")) != "once":
+                    await self._mark_rule(rule_id, now, message)
+                else:
+                    await self.rule_dao.update({
+                        "last_result": message[:256],
+                        "update_time": now,
+                    }, {"id": rule_id})
                 return
             message = (
                 f"Triggered batch #{batch_id}: sent to {sent_count}/{len(target_clients)} browser instances"
@@ -198,11 +226,19 @@ class PluginTriggerScheduler:
                 message += "; failed: " + "; ".join(sorted(set(failed_messages)))[:360]
             await self._write_log(rule_id, batch_id, source, "triggered", message, sent_count)
             await self._mark_rule(rule_id, now, message)
+            if str(rule.get("trigger_type")) == "once":
+                await self._disable_once_rule(rule_id, now)
         except Exception as exc:
             message = str(exc)[:512]
             logger.exception(f"Trigger rule {rule_id} failed: {message}")
             await self._write_log(rule_id, None, source, "failed", message, len(target_clients))
-            await self._mark_rule(rule_id, now, message)
+            if str(rule.get("trigger_type")) != "once":
+                await self._mark_rule(rule_id, now, message)
+            else:
+                await self.rule_dao.update({
+                    "last_result": message[:256],
+                    "update_time": now,
+                }, {"id": rule_id})
 
     async def _resolve_clients(self, rule: Dict[str, Any]) -> tuple[List[int], Dict[str, Any]]:
         target_type = str(rule.get("target_type") or "client")
@@ -216,6 +252,7 @@ class PluginTriggerScheduler:
             "c.admin_id <> 0",
             "c.computer_id IS NOT NULL",
             "c.computer_id <> 0",
+            "c.is_online = 1",
             """
             NOT EXISTS (
                 SELECT 1 FROM fp_spider_client_task e
@@ -426,6 +463,12 @@ class PluginTriggerScheduler:
             "update_time": now,
         }, {"id": rule_id})
 
+    async def _disable_once_rule(self, rule_id: int, now: datetime):
+        await self.rule_dao.update({
+            "status": 0,
+            "update_time": now,
+        }, {"id": rule_id})
+
     async def _update_next_time(self, rule: Dict[str, Any], now: datetime):
         # The next time is informational for the admin UI; due checks remain source of truth.
         trigger_type = str(rule.get("trigger_type") or "")
@@ -441,6 +484,8 @@ class PluginTriggerScheduler:
             next_time = datetime.combine(now.date(), run_time)
             if next_time <= now:
                 next_time += timedelta(days=1)
+        elif trigger_type == "once":
+            next_time = self._to_datetime(schedule.get("run_at"))
         elif trigger_type == "monthly":
             run_time = self._parse_time(schedule.get("time") or "09:00")
             day = max(1, min(28, int(schedule.get("day") or 1)))

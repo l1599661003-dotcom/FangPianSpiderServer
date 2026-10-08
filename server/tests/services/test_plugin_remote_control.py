@@ -36,6 +36,12 @@ class FakeClientDao:
         self.rows_by_id[row_id] = {**row, "id": row_id}
         return row_id
 
+    async def update(self, values, where):
+        row_id = where.get("id")
+        if row_id in self.rows_by_id:
+            self.rows_by_id[row_id].update(values)
+        return True
+
 
 class FakeUpgradeManager:
     def is_connected(self, client_id):
@@ -113,6 +119,47 @@ class PluginRemoteControlServiceTests(unittest.TestCase):
 
         self.assertTrue(result["created"])
         self.assertIsNone(client_dao.inserted["admin_id"])
+        self.assertEqual(client_dao.inserted["status"], 0)
+
+    def test_register_enables_logged_in_browser(self):
+        service = self._service()
+        client_dao = FakeClientDao()
+        service.client_dao = client_dao
+        service.employee_dao = mock.Mock()
+        service.employee_dao.fetch_one = mock.AsyncMock(return_value={"id": 12})
+
+        result = asyncio.run(
+            service.register(
+                {
+                    "device_id": "device-123456",
+                    "browser_type": "Chrome",
+                    "browser_version": "1",
+                    "extension_version": "0.0.43",
+                    "tianji_employee_id": 12,
+                },
+                "127.0.0.1",
+            )
+        )
+
+        self.assertTrue(result["created"])
+        self.assertEqual(client_dao.inserted["admin_id"], 12)
+        self.assertEqual(client_dao.inserted["status"], 1)
+
+    def test_update_account_context_enables_logged_in_browser(self):
+        service = self._service()
+        client_dao = FakeClientDao()
+        client_dao.rows_by_id[7] = {"id": 7, "status": 0, "admin_id": None}
+        service.client_dao = client_dao
+        service.client_account_dao = mock.Mock()
+        service.client_account_dao.fetch_one = mock.AsyncMock(return_value=None)
+        service.client_account_dao.insert = mock.AsyncMock()
+        service.employee_dao = mock.Mock()
+        service.employee_dao.fetch_one = mock.AsyncMock(return_value={"id": 12})
+
+        asyncio.run(service.update_account_context(7, {"tianji_employee_id": 12}))
+
+        self.assertEqual(client_dao.rows_by_id[7]["admin_id"], 12)
+        self.assertEqual(client_dao.rows_by_id[7]["status"], 1)
 
     def test_build_upgrade_notice_includes_normalized_sha256(self):
         service = self._service()
