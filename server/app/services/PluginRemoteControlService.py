@@ -623,7 +623,7 @@ class PluginRemoteControlService:
             FROM fp_spider_client_task e
             INNER JOIN fp_spider_task t ON t.id = e.task_id
             LEFT JOIN fp_spider_client_task_log l ON l.id = e.task_log_id
-            WHERE t.control_action IS NOT NULL AND e.status IN (0, 1)
+            WHERE t.control_action IS NOT NULL AND e.status = 1
             """
         )
         task_ids = set()
@@ -773,8 +773,12 @@ class PluginRemoteControlService:
             sent = False
             if eligible:
                 if not self.manager.claim_execution(client_id, client_task_id):
-                    reason = "浏览器实例已有任务正在执行"
-                    await self._finish_execution(client_task_id, 3, reason, 0, 0, 1, 0)
+                    reason = "浏览器正在执行其他任务，已排队"
+                    await self.client_task_dao.update({
+                        "status": 0,
+                        "result": reason,
+                        "update_time": datetime.now(),
+                    }, {"id": client_task_id})
                 else:
                     sent = await self.manager.send(client_id, {
                         "cmd": "plugin_command",
@@ -804,12 +808,6 @@ class PluginRemoteControlService:
             return False, "浏览器实例尚未绑定员工、电脑分组或未启用"
         if not self.manager.is_connected(client_id):
             return False, "浏览器实例已离线"
-        running = await self.client_task_dao.fetch_one(
-            "SELECT id FROM fp_spider_client_task WHERE client_id = :client_id AND status = 1 LIMIT 1",
-            {"client_id": client_id},
-        )
-        if running:
-            return False, "浏览器实例已有任务正在执行"
         return True, ""
 
     async def handle_event(self, client_id: int, event: Dict[str, Any]):
@@ -860,6 +858,16 @@ class PluginRemoteControlService:
                 )
         elif cmd == "command_complete":
             status_name = str(data.get("status") or "failed")
+            message = str(data.get("error") or data.get("message") or status_name)
+            if "current browser instance is busy" in message or "浏览器实例已有任务正在执行" in message:
+                await self.client_task_dao.update({
+                    "status": 0,
+                    "result": "浏览器正在执行其他任务，已排队",
+                    "end_time": None,
+                    "update_time": datetime.now(),
+                }, {"id": execution_id})
+                await self.refresh_task_status(execution["task_id"])
+                return
             if status_name not in FINAL_EXECUTION_STATUSES:
                 status_name = "failed"
             status = 2 if status_name == "success" else (4 if status_name == "stopped" else 3)
@@ -884,7 +892,7 @@ class PluginRemoteControlService:
                 int(data.get("failed", 0) or 0),
                 float(data.get("progress", 100 if status == 2 else 0) or 0),
             )
-            self.manager.release_execution(client_id, execution_id)
+            await self.release_and_dispatch(client_id, execution_id)
             if data.get("cookie_uploaded"):
                 await self.update_account_context(client_id, data)
         await self.refresh_task_status(execution["task_id"])
@@ -928,7 +936,7 @@ class PluginRemoteControlService:
             int(execution.get("fail_num") or 0),
             float(execution.get("progress") or 0),
         )
-        self.manager.release_execution(client_id, execution_id)
+        await self.release_and_dispatch(client_id, execution_id)
         await self.refresh_task_status(task_id)
 
     async def finish_disconnected_executions(self, client_id: int):
@@ -993,6 +1001,12 @@ class PluginRemoteControlService:
             raise ValueError("批量任务不存在")
         now = datetime.now()
         await self.task_dao.update({"stop_requested": 1, "update_time": now}, {"id": batch_id})
+        queued = await self.client_task_dao.fetch_all(
+            "SELECT id, progress FROM fp_spider_client_task WHERE task_id = :task_id AND status = 0",
+            {"task_id": batch_id},
+        )
+        for execution in queued:
+            await self._finish_execution(execution["id"], 4, "排队任务已停止", 0, 0, 0, float(execution.get("progress") or 0))
         executions = await self.client_task_dao.fetch_all(
             "SELECT * FROM fp_spider_client_task WHERE task_id = :task_id AND status = 1",
             {"task_id": batch_id},
@@ -1086,3 +1100,69 @@ class PluginRemoteControlService:
             "end_time": datetime.now(),
             "update_time": datetime.now(),
         }, {"id": task_id})
+
+    async def release_and_dispatch(self, client_id: int, execution_id: Optional[int] = None):
+        current = self.manager.busy_executions.get(int(client_id))
+        self.manager.release_execution(int(client_id), execution_id)
+        if execution_id is not None and current != int(execution_id):
+            return
+        await self.dispatch_next_queued(int(client_id))
+
+    async def dispatch_next_queued(self, client_id: int):
+        """当前浏览器空出来后，把最早排队的一条任务发出去。"""
+        if client_id in self.manager.busy_executions:
+            return
+        row = await self.client_task_dao.fetch_one(
+            """
+            SELECT e.id, e.task_id, e.client_id, t.control_action, t.control_params, t.stop_requested
+            FROM fp_spider_client_task e
+            INNER JOIN fp_spider_task t ON t.id = e.task_id
+            WHERE e.client_id = :client_id
+              AND e.status = 0
+              AND t.control_action IS NOT NULL
+              AND t.control_action <> ''
+            ORDER BY e.id ASC
+            LIMIT 1
+            """,
+            {"client_id": client_id},
+        )
+        if not row or int(row.get("stop_requested") or 0) == 1:
+            return
+        execution_id = int(row["id"])
+        task_id = int(row["task_id"])
+        if not self.manager.claim_execution(client_id, execution_id):
+            return
+        try:
+            params = json.loads(row.get("control_params") or "{}")
+        except Exception:
+            params = {}
+        if not isinstance(params, dict):
+            params = {}
+        now = datetime.now()
+        sent = await self.manager.send(client_id, {
+            "cmd": "plugin_command",
+            "batch_id": task_id,
+            "execution_id": execution_id,
+            "action": row.get("control_action"),
+            "params": params,
+            "timestamp": now.timestamp(),
+        })
+        if not sent:
+            self.manager.release_execution(client_id, execution_id)
+            await self._finish_execution(execution_id, 3, "浏览器实例已离线", 0, 0, 1, 0)
+            await self.refresh_task_status(task_id)
+            return
+        await self.client_task_dao.update({
+            "status": 1,
+            "result": "",
+            "start_time": now,
+            "update_time": now,
+        }, {"id": execution_id})
+        execution = await self.client_task_dao.fetch_one(
+            "SELECT task_log_id FROM fp_spider_client_task WHERE id = :id LIMIT 1",
+            {"id": execution_id},
+        )
+        if execution and execution.get("task_log_id"):
+            await self.task_log_dao.update({"status": 1, "update_time": now}, {"id": execution["task_log_id"]})
+        asyncio.create_task(self._fail_execution_after_timeout(execution_id, client_id, task_id))
+        await self.refresh_task_status(task_id)
