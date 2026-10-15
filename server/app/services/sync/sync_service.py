@@ -12,9 +12,27 @@ from server.app.services.sync.table_mapper import TABLE_MAPPING
 
 class MongoToMySQLSyncService:
     """MongoDB到MySQL的数据同步服务"""
+
+    # 更新已有行时，这些字段值为空则保留库里的原值。
+    # 只覆盖身份类文本，不动粉丝数、报价等数值字段的既有更新语义。
+    PRESERVE_ON_EMPTY_FIELDS = (
+        'creator_nickname',
+        'creator_avatar',
+        'creator_location',
+        'creator_intro',
+        'platform_account_id',
+    )
     
     def __init__(self):
         self.table_mapper = TABLE_MAPPING
+
+    @staticmethod
+    def _is_blank(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ''
+        return False
     
     async def initialize(self):
         """初始化服务，预加载缓存数据"""
@@ -251,6 +269,11 @@ class MongoToMySQLSyncService:
                 for doc in to_update:
                     where = {mysql_primary_key: doc.get(mysql_primary_key)}
                     update_data = {field: doc.get(field, None) for field in update_fields}
+                    # 身份类文本字段来源经常缺失（例如星图基础信息不回 nick_name），
+                    # 空值不参与更新，避免把库里已有的昵称、头像等刷成空。
+                    for field in self.PRESERVE_ON_EMPTY_FIELDS:
+                        if field in update_data and self._is_blank(update_data[field]):
+                            update_data.pop(field)
                     # 使用当前时间戳（秒数）
                     current_timestamp = int(datetime.now().timestamp())
                     # update_data['update_time'] = current_timestamp
