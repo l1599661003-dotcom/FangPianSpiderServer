@@ -13,14 +13,34 @@ from server.app.services.sync.table_mapper import TABLE_MAPPING
 class MongoToMySQLSyncService:
     """MongoDB到MySQL的数据同步服务"""
 
-    # 更新已有行时，这些字段值为空则保留库里的原值。
-    # 只覆盖身份类文本，不动粉丝数、报价等数值字段的既有更新语义。
+    # 只对博主主档做空值保护。笔记、粉丝画像等表是整包快照，空值仍按原语义覆盖。
+    PRESERVE_TABLES = ('fp_creator',)
+
+    # 来源缺字段时不要把库里的身份资料刷成空。
     PRESERVE_ON_EMPTY_FIELDS = (
         'creator_nickname',
         'creator_avatar',
         'creator_location',
         'creator_intro',
         'platform_account_id',
+        'content_field',
+        'creator_feature_tags',
+        'creator_personal_tags',
+        'creator_pgy_tag',
+        'kol_head_label',
+    )
+
+    # 插件缺值时常传 0。0 视为没抓到，不能把已有粉丝数、报价、机构写成 0。
+    PRESERVE_ON_ZERO_FIELDS = (
+        'fans_count',
+        'like_collect_count',
+        'business_note_count',
+        'picture_price',
+        'video_price',
+        'interact_mid_num',
+        'account_level',
+        'mcn_id',
+        'creator_gender',
     )
     
     def __init__(self):
@@ -33,6 +53,35 @@ class MongoToMySQLSyncService:
         if isinstance(value, str):
             return value.strip() == ''
         return False
+
+    @staticmethod
+    def _is_missing_number(value: Any) -> bool:
+        if value is None or isinstance(value, bool):
+            return True
+        if isinstance(value, str):
+            text = value.strip()
+            if text == '':
+                return True
+            try:
+                value = float(text)
+            except ValueError:
+                return True
+        if isinstance(value, (int, float)):
+            return value == 0
+        return False
+
+    def _drop_missing_profile_fields(self, update_data: Dict[str, Any], mysql_table: str) -> Dict[str, Any]:
+        """已有博主更新时，缺值字段不参与 UPDATE，避免把库里的昵称和资料刷空。"""
+        if mysql_table not in self.PRESERVE_TABLES:
+            return update_data
+
+        for field in self.PRESERVE_ON_EMPTY_FIELDS:
+            if field in update_data and self._is_blank(update_data[field]):
+                update_data.pop(field)
+        for field in self.PRESERVE_ON_ZERO_FIELDS:
+            if field in update_data and self._is_missing_number(update_data[field]):
+                update_data.pop(field)
+        return update_data
     
     async def initialize(self):
         """初始化服务，预加载缓存数据"""
@@ -269,11 +318,11 @@ class MongoToMySQLSyncService:
                 for doc in to_update:
                     where = {mysql_primary_key: doc.get(mysql_primary_key)}
                     update_data = {field: doc.get(field, None) for field in update_fields}
-                    # 身份类文本字段来源经常缺失（例如星图基础信息不回 nick_name），
-                    # 空值不参与更新，避免把库里已有的昵称、头像等刷成空。
-                    for field in self.PRESERVE_ON_EMPTY_FIELDS:
-                        if field in update_data and self._is_blank(update_data[field]):
-                            update_data.pop(field)
+                    # 星图/蒲公英基础信息经常不回昵称、头像，粉丝数缺值还会传 0。
+                    # 这些缺值不参与更新，避免把库里已有资料刷空。
+                    update_data = self._drop_missing_profile_fields(update_data, table_config['mysql_table'])
+                    if not update_data:
+                        continue
                     # 使用当前时间戳（秒数）
                     current_timestamp = int(datetime.now().timestamp())
                     # update_data['update_time'] = current_timestamp
