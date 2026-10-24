@@ -183,6 +183,13 @@ FIELD_TYPES: Dict[str, str] = {
     'fans_provinces': 'json',
     'fans_cities': 'json',
     'fans_devices': 'json',
+    'old_ratio': 'json',
+    'region_distribution': 'json',
+    'below_ratio': 'json',
+    'city_ratio': 'json',
+    'city_leve_ratio': 'json',
+    'devices_ratio': 'json',
+    'interests_ratio': 'json',
 
     'date_key': 'date_to_int',
 
