@@ -234,6 +234,7 @@ TABLE_MAPPING: Dict[str, Dict[str, Any]] = {
     'blogger_fans_history': {
         'mysql_table': 'fp_creator_fans_history',
         'primary_key': 'platform_user_id',
+        'business_keys': ['platform_user_id', 'dateKey'],
         'sync_key': 'sync_status',
         'batch_size': 100,
         'is_update': False,
