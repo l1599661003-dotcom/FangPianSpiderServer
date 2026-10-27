@@ -89,10 +89,12 @@ class FieldMapper:
             value: MCN信息
             
         Returns:
-            MCN的ID值
+            MCN的ID值。空签约返回 0，用于清空库里的旧机构。
         """
+        # 空签约（None / '' / {}）表示已解约，返回 0 覆盖库里的旧 mcn_id。
+        # 不能返回 None：同步层会把 NULL 当成缺值，不写入 UPDATE。
         if not value:
-            return None
+            return 0
             
         # 确保缓存已加载
         if not cls._mcn_cache_loaded:
@@ -102,7 +104,7 @@ class FieldMapper:
         mcn_user_id = value if isinstance(value, str) else value.get('userId', '')
         
         if not mcn_user_id:
-            return None
+            return 0
             
         # 如果在缓存中已存在，直接返回ID
         if mcn_user_id in cls._mcn_cache:

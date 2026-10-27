@@ -30,7 +30,8 @@ class MongoToMySQLSyncService:
         'kol_head_label',
     )
 
-    # 插件缺值时常传 0。0 视为没抓到，不能把已有粉丝数、报价、机构写成 0。
+    # 插件缺值时常传 0。0 视为没抓到，不能把已有粉丝数、报价写成 0。
+    # mcn_id 不在此列：签约机构空了是解约，必须覆盖。
     PRESERVE_ON_ZERO_FIELDS = (
         'fans_count',
         'like_collect_count',
@@ -39,8 +40,13 @@ class MongoToMySQLSyncService:
         'video_price',
         'interact_mid_num',
         'account_level',
-        'mcn_id',
         'creator_gender',
+    )
+
+    # 签约机构空了是真实状态（已解约 / 未签约），必须覆盖库里的旧 mcn_id。
+    # noteSign 空值经 mcn_convert 写成 0；这里再兜一层，避免漏网的 None/0 被跳过。
+    FORCE_EMPTY_FIELDS = (
+        'mcn_id',
     )
     
     def __init__(self):
@@ -81,6 +87,9 @@ class MongoToMySQLSyncService:
         for field in self.PRESERVE_ON_ZERO_FIELDS:
             if field in update_data and self._is_missing_number(update_data[field]):
                 update_data.pop(field)
+        for field in self.FORCE_EMPTY_FIELDS:
+            if field in update_data and self._is_missing_number(update_data[field]):
+                update_data[field] = 0
         return update_data
     
     async def initialize(self):
@@ -320,6 +329,7 @@ class MongoToMySQLSyncService:
                     update_data = {field: doc.get(field, None) for field in update_fields}
                     # 星图/蒲公英基础信息经常不回昵称、头像，粉丝数缺值还会传 0。
                     # 这些缺值不参与更新，避免把库里已有资料刷空。
+                    # 签约机构（noteSign → mcn_id）除外：空值表示已解约，必须覆盖旧值。
                     update_data = self._drop_missing_profile_fields(update_data, table_config['mysql_table'])
                     if not update_data:
                         continue
@@ -368,9 +378,9 @@ class MongoToMySQLSyncService:
                     field_type = FIELD_TYPES[mysql_field]
                     transformer = FIELD_TRANSFORMERS.get(field_type)
                     if transformer and asyncio.iscoroutinefunction(transformer):
-                        # 执行异步转换
+                        # 执行异步转换。mcn_convert 空值也要跑，解约时才能写成 0。
                         value = doc.get(mongo_field)
-                        if value is not None:
+                        if value is not None or field_type == 'mcn_convert':
                             transformed_doc[mysql_field] = await transformer(value)
             
             transformed.append(transformed_doc)
