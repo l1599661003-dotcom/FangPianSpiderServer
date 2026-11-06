@@ -16,6 +16,13 @@ class MongoToMySQLSyncService:
     # 只对博主主档做空值保护。笔记、粉丝画像等表是整包快照，空值仍按原语义覆盖。
     PRESERVE_TABLES = ('fp_creator',)
 
+    # 星图可选接口失败时，插件不会提交这些表。即使误提交了空行，也不能按主键整行删除，
+    # 否则粉丝画像、种草、转化、连接用户会被一次失败清掉。
+    SKIP_EMPTY_REPLACE_TABLES = (
+        'fp_douyin_kol_profile',
+        'fp_creator_fans_history',
+    )
+
     # 来源缺字段时不要把库里的身份资料刷成空。
     PRESERVE_ON_EMPTY_FIELDS = (
         'creator_nickname',
@@ -30,17 +37,26 @@ class MongoToMySQLSyncService:
         'kol_head_label',
     )
 
-    # 插件缺值时常传 0。0 视为没抓到，不能把已有粉丝数、报价写成 0。
-    # mcn_id 不在此列：签约机构空了是解约，必须覆盖。
+    # 插件缺值时常传 0。0 视为没抓到，不能把已有粉丝数写成 0。
+    # 报价不在此列：星图这次没返回某个档位，就是这个档位没报价，必须覆盖旧值。
+    # mcn_id 也不在此列：签约机构空了是解约，必须覆盖。
     PRESERVE_ON_ZERO_FIELDS = (
         'fans_count',
         'like_collect_count',
         'business_note_count',
-        'picture_price',
-        'video_price',
         'interact_mid_num',
         'account_level',
         'creator_gender',
+    )
+
+    # 报价接口成功但某个档位缺失时，插件会显式传 0。0 和空都要写成 0，清掉旧报价。
+    CLEAR_ZERO_PRICE_FIELDS = (
+        'picture_price',
+        'video_price',
+        'price_platform_raw',
+        'price_1_20s',
+        'price_20_60s',
+        'price_60s_plus',
     )
 
     # 签约机构空了是真实状态（已解约 / 未签约），必须覆盖库里的旧 mcn_id。
@@ -51,6 +67,35 @@ class MongoToMySQLSyncService:
     
     def __init__(self):
         self.table_mapper = TABLE_MAPPING
+
+    @staticmethod
+    def _row_has_payload(doc: Dict[str, Any], key_fields: List[str]) -> bool:
+        """业务键之外至少有一个非空值，才算这次接口真的抓到了数据。"""
+        for field, value in doc.items():
+            if field in key_fields or value is None:
+                continue
+            if isinstance(value, str) and value.strip() == '':
+                continue
+            return True
+        return False
+
+    def _filter_replace_rows(
+        self,
+        transformed_data: List[Dict[str, Any]],
+        table_config: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """可选接口没抓到时跳过替换，保留库里上次成功的画像和趋势。"""
+        if table_config['mysql_table'] not in self.SKIP_EMPTY_REPLACE_TABLES:
+            return transformed_data
+
+        key_fields = set(self._get_business_key_fields(table_config))
+        kept = [doc for doc in transformed_data if self._row_has_payload(doc, key_fields)]
+        skipped = len(transformed_data) - len(kept)
+        if skipped:
+            logger.warning(
+                f"表 {table_config['mysql_table']} 跳过 {skipped} 条空数据，保留已有记录"
+            )
+        return kept
 
     @staticmethod
     def _is_blank(value: Any) -> bool:
@@ -87,6 +132,9 @@ class MongoToMySQLSyncService:
         for field in self.PRESERVE_ON_ZERO_FIELDS:
             if field in update_data and self._is_missing_number(update_data[field]):
                 update_data.pop(field)
+        for field in self.CLEAR_ZERO_PRICE_FIELDS:
+            if field in update_data and self._is_missing_number(update_data[field]):
+                update_data[field] = 0
         for field in self.FORCE_EMPTY_FIELDS:
             if field in update_data and self._is_missing_number(update_data[field]):
                 update_data[field] = 0
@@ -145,6 +193,23 @@ class MongoToMySQLSyncService:
                             # 执行更新操作
                             await self._update_mysql_data(mysql_dao, transformed_data, table_config)
                         else:
+                            transformed_data = self._filter_replace_rows(transformed_data, table_config)
+                            if not transformed_data:
+                                logger.info(f"集合 {collection_name} 本次没有可替换的数据，保留已有记录")
+                                await mongo_dao.update_many(
+                                    {table_config['primary_key']: {'$in': [
+                                        doc.get(table_config['primary_key'])
+                                        for doc in unsynced_data
+                                        if table_config['primary_key'] in doc
+                                    ]}},
+                                    {table_config['sync_key']: 1}
+                                )
+                                continue
+                            fields = list(table_config['fields'].values())
+                            values = [
+                                [doc.get(field, None) for field in fields]
+                                for doc in transformed_data
+                            ]
                             deleted_count, has_business_keys = await self._delete_existing_records(
                                 mysql_dao,
                                 transformed_data,
@@ -213,6 +278,15 @@ class MongoToMySQLSyncService:
                         # 执行更新操作
                         await self._update_mysql_data(mysql_dao, transformed_data, table_config)
                     else:
+                        transformed_data = self._filter_replace_rows(transformed_data, table_config)
+                        if not transformed_data:
+                            logger.info(f"集合 {collection_name} 本次没有可替换的数据，保留已有记录")
+                            return
+                        fields = list(table_config['fields'].values())
+                        values = [
+                            [doc.get(field, None) for field in fields]
+                            for doc in transformed_data
+                        ]
                         deleted_count, has_business_keys = await self._delete_existing_records(
                             mysql_dao,
                             transformed_data,
